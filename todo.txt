@@ -1,0 +1,649 @@
+﻿
+
+■計画
+
+P01 20120720 write cache
+~~~~~~~~~~~~~~~~~~~~~~~~
+1. 考察: 現在の構造 [完]
+2. 考察: 実装方法 [完]
+3. 実装: sftp 依存部分の分離 [完]
+4. リンクの動作確認
+  ショートカットは余裕が有れば実装□
+
+5. バグ: 特定のファイルの読み取りに失敗 [完]
+6. バグ: その他細かいバグ [完]
+7. 実装: 仮想変更機能 [完]
+8. 修正: 細々とした修正・改良
+8.7 ReadData で実際にダウンロードする範囲を最低限に抑える。[完]
+  今後本格的に動作確認した方が良いかも知れない□
+9. 実装: 書込機能 [完]
+
+* setStat で明示的に適用する属性を指定する [完]
+  現状の実装だと全ての属性をリモートに新しく設定している。
+  しかし、例えばファイルサイズだけを指定したいのに他の属性も上書きして仕舞うというのは、
+  (同じ値で上書きしている筈といっても) 何となく気分が悪い。
+  そこで、chmod や setMtime 等、専用の関数がある物についてはそれを使って適用する様にしようと考えた。
+  
+  …が、chmod や setMtime の実装を見てみたら結局 setStat を内部で呼び出していた。
+  と思ったのだけれど、setstat する時にはリモートに何を適用するかのフラグを指定する事ができる、
+  という事も分かった。しかし、このフラグは SftpATTR が内部に持っている物で外部から指定する事ができない。
+  仕方がないのでフラグを明示的に指定できる関数 setstat_noglob を追加してそれを利用する事にした。
+  元々の setStat は glob 機能 (* や ? 等のワイルドカードの解釈) がついていたが、
+  これは今回は要らないのでその機能も省いておいた。
+  
+  というか、勝手にフラグの隠蔽やらやっていて、
+  フラグを明示的に指定する関数すら用意していない。Tamir.SharpSSH は良い実装ではない。
+    しかも、その実装も完璧でない。フラグを隠蔽している為に ChannelSftp
+  クラスの使用方法が難しくなっている。例えば、attr.setMtime(...);sftp.chmod(permission,path);sftp.setStat(path,attr);
+  としても Mtime 情報はリモートに適用されない。chmod によってフラグがクリアされてしまうので、
+  chmod を実行する前に setStat を実行しておかなければならないのである。
+  とか色々、中を覗かないと分からないルールが一杯。この実装は頭悪い。java からわざわざ移植する必要あったのか。
+
+  とにかく、指定した属性しかリモートに適用しない様にする事ができたので、
+  InternalSetFile の内容を再度書き直してより良いようにした。
+  
+* UpdateMoveFile する時に当初上書きを企図していたか確認するべき
+  MoveFile で CacheChange を登録した時に上書きを意図していたかどうかを記録する。
+  上書きを意図していた時に限り上書きでデータを消し、
+  それ以外の場合には mv A A~ でバックアップするべき。
+  
+  他にも削除されるファイルについての情報を用いて、
+  実際に操作が実行される瞬間に確認を行った方が良い。
+
+* 連続・オーバーラップする書込操作は結合する ■
+
+  巨大な塊で書込を実行すると途中で失敗した時にまた一番初めからやり直す事になる。
+  なので、操作を結合するのは構わないが、アップロードする時には
+  少しずつキャッシュ内容を書換ながら進んでいくべきである。
+  既定の動作の通り、64KiB ずつ進んでいくのが良いのではないかと思う。
+  
+  然しキャッシュファイルを安全に (途中でクラッシュしても大丈夫な様に) 変更する事は可能だろうか。
+  つまり、昔に書き込んだ内容を絶対に破壊しない様に書き換えるという事である。
+  例えば、新しく追記する場合に無事に全ての追記データを書き込んで
+  ファイルのヘッダにある長さ情報を書き換えている途中にクラッシュしたとする。
+  その確率はとても小さいしハードウェアによっては長さ情報の 4B ぐらいアトミックに書換可能かも知れない。
+  しかし、実際にそれが起こってしまった場合、既存のデータをも破壊してしまう危険性がある。
+  
+  或いは、ファイルの内容を完全にコピーして追記を実行してから、
+  mv で既存のファイルと置き換えるという手もある。
+  ファイルの移動はアトミックにできる様になっているはずだし、
+  途中で失敗してもファイルシステムの機能で復元してくれるはずなので、
+  この様にすれば安全なはずである。
+  しかし、新しく追記するたびにファイルの内容を全部コピーするのは重い操作である。
+  
+  それならばインデックスのファイルだけを mv によって置き換える事にして、
+  データのファイルは書いたら書きっぱなしで沢山のファイルに分散させても良いという考え方もある。
+  或いは、別に一つのファイルにどんどん追記していくのでも構わない。
+  クリティカルセクションはインデックスの書換だけだから。
+  こうすればそんなに重くはならないと思う…。
+  
+  というか、良く考えたらキャッシュファイルの方は結合しなくても良い気もする。
+  というのもクラッシュした後に再度結合操作を実行すれば良いだけだからである。
+  つまり結合はメモリ上だけでやるという事。
+  
+
+* emacs を起動すると Q:\ 直下読み取りで IO Error ■
+  ファイルが存在しませんでしたとかではなく、
+  単に -1 を返したりしているのが行けないのだろうか。。。
+  
+  →取り敢えず MainFs でまともな値を返す様に変更を行ったが、
+  それでも状況は変わっていない様子である。
+
+* OpenFile/CloseFile ■■
+  ファイルの移動をした時の、
+  元の basic に対する OpenFile/CloseFile の管理が適当である。
+  元の basic に対して OpenFile を伝達したなら、
+  その時の bpath を覚えておいて対応する CloseFile の時に、
+  元々の bpath に対して CloseFile を伝達するべきである。
+  →しかしそうするとファイルを移動した時に元々の basic に対して、
+    OpenFile/CloseFile が有効に作用しない事になる。
+    
+  或いは、現在開いているファイルを CachedFsBasic で全て管理するか。
+  PathRedirect する度に指し示している先が変化していないか確認し、
+  もし変化が起こっていたら CloseFile(old_bpath)/OpenFile(new_bpath) する。
+  PathRedirect する度というよりは ReadData/WriteData を実行する度?
+  
+10 復元機能
+  fsid を正しく割り当てる。Guid で適当に割り当てれば OK。
+  .write 書込が終了してから magic を書き込む様にする。
+  magic が設定されていない物は書込途中でクラッシュしたという事であり復元しなくて良い。
+  起動時に .write ファイルが残っていた場合に、それを読み取って dlist を再構築する。
+
+11 変更の衝突に対する警告機能
+  変更の衝突が起こったら少なくともログに書き出すぐらいの事はしたい。
+
+
+■reports
+
+  ZoneID に対応
+    http://www.atmarkit.co.jp/fwin2k/win2ktips/498zoneid/zoneid.html
+    ReadFile で対応するだけでなく、GetFileInfo でも対応しないとちゃんと読んでくれない様子?
+    GetFileInfo で対応した気になっていたら、
+    CreateFile でもちゃんと対応しなければならない様子である…。
+    これは GvfsOperation で対応するよりも、FsBasic の側で対応した方が良いという事だろうか。。。
+    (然し、FsBasic の側で AdsPath の解析をするというのも面倒である…)
+    
+    現状:
+      ReadFile/WriteFile/CreateFile/GetFileInformation で調べている。
+      SetFileSize/SetFileAttributes/SetAllocationSize/SetEndOfFile/DeleteFile では調べていない。
+      FlushFileBuffers/CloseFile/Cleanup/LockFile/UnlockFile では抑も何もしていない。
+    
+    ADS 周りも設計を見直した方が良い。
+    要件:
+    * 通常ファイルと同様に操作可能 (GetFileInfo から色々)
+    * GetFileList では取得しない
+    * SftpFsBasic: Unix で本当に "aaa:bbb" という名を持つファイルとは区別
+      ResolvePath の時点で区別する方法?
+    * 書き込めなくても良い
+    * "text:stream:$type" と "text:stream" は区別しない
+      $type としては $DATA 決め打ちでも良いかも知れない。
+    
+    現在の IFsBasic を変更しないとしたら、
+    GvfsOperation は完全に ADS を意識せずに実装する。
+    ADS に干渉する FsBasic-FsBasic Adapter を作成しても良い。
+    a Zone.Identifier 等、一部の ADS にしか干渉しない Adapter
+    b 一般の ADS に対して干渉を実行する Adapter
+        その場合は IFsBasicAds 等という物を用意して、
+        元の IFsBasic 側に機能を追加する事によって実装を行っても OK。
+
+
+    
+  ミラーリング機能
+    対象ディレクトリを選択。
+    積極的ミラーリングから、受動的ミラーリングまで。
+    積極的ミラーリングの場合には、定期的に実行するタイミングを指定。
+    
+    △しかし、これはファイルシステムとは独立に実装できるのではないか…。
+      わざわざ FS の機能として実装する必要性はあるか?
+      →FS でないとエラーでディレクトリの内容が空に見えたのか、
+        本当にディレクトリの中身が空になってしまったのかを判別できない。
+        FS と一緒に実装しないと単なるエラーなのに、
+        キャッシュを全て削除してしまったという事になりかねない。
+    
+    それに FS 自体のキャッシュとしてミラーを使用する事もできる。
+      キャッシュするぐらいならミラーするという事。
+
+20120720
+  アカウントの有効・無効を設定するオプション
+    現在ログインできないサーバなどに対しても接続の試行を実行してしまうのが良くないので。
+    これはすぐに実装できた。簡単
+
+  TODO
+    再接続試行は接続が失われた時だけ
+      JschException e;e.id を用いればエラーの種類を特定できる
+      (本当に e.id が信頼できるかどうかは実際に調べた方が良いかも知れない)
+
+    ShellExtension で drwxrwxrwx を詳細表示に表示できないか?
+      <a href="http://msdn.microsoft.com/ja-jp/library/ms997572.aspx">ファイルの詳細情報に対してシェル カラム ハンドラを使用する</a>
+      <a href="http://myprivateadversaria.seesaa.net/article/111029152.html">My Private Adversaria: Shell Extension を使って Explorer に項目を追加する</a>
+      Initialize:
+        対象のディレクトリが sftp (gvfs) の時にだけ S_OK を返し、
+        それ以外の場合には E_FAIL を返す。
+      
+      <a href="http://www.codeguru.com/cpp/com-tech/shell/general/article.php/c7353/Simple-Shell-Extension-to-Manipulate-File-Summary-Information.htm">Simple Shell Extension to Manipulate File Summary Information</a>
+        これを使えば、プロパティの詳細タブで値を読み書きできるか?
+        (もしかすると変更はできないかも知れない。)
+      
+      他 ShellEx 便利そうなリンク
+      <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/cc144067(v=vs.85).aspx">Creating Shell Extension Handlers</a>
+      <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/hh127442(v=vs.85).aspx">How to Implement Icon Overlay Handlers</a>
+      <a href="http://blogs.msdn.com/b/codefx/archive/2010/09/14/writing-windows-shell-extension-with-net-framework-4-c-vb-net-part-1.aspx">Writing Windows Shell Extension with .NET Framework 4 (C#, VB.NET) - Part 1: Context Menu Handler - Microsoft All-In-One Code Framework - Site Home - MSDN Blogs</a>
+      
+    ls がやはり遅い
+      キャッシュがクリアされないバグの為に ls が一回だけしか実行されない状況になっていた。
+      この状況ではかなり軽く動作していたが、バグを修正したらまた重くなった。
+      ls を頻繁に実行する事が原因で全体的な速度が落ちているのかも知れない。
+      今後この辺りを改良する価値はありそう。
+
+20120216
+  write cache を可能にする
+    mv, rm 等の操作に対してもキャッシュしなければならない
+    更に、未だ update していないけれども読み込みたい時には、
+    それらの操作をした結果として表示する必要がある。
+  　
+    変更の衝突について
+      キャッシュしている場合に、こちらで変更した内容を書き出す前に
+      リモート側で変更があった場合にどうすればよいか?
+      この場合は、残念ながら「データが失われました」とか何とか言って書込を実行しないという事にするしかない。
+      
+      また、mv や rm 等の操作についても衝突は起こり得る。
+      1. こちらで rm [未だ update しない]
+      2. 向こうで touch
+      3. こちら→向こうで rm [折角 touch した物が消えてしまう]
+      しかし、この様な場合にまで対処はしていられない。というか、同時に操作するのが悪い。
+      (こちらと向こうで同期しながら 1./2. を実行する事はないだろう、という仮定。)
+  5 秒以内にアクセスしたディレクトリについては自動で ls する
+    ファイルアクセス時に 10 秒以内に更新されていないディレクトリは ls する
+  ls の為だけに ssh でコマンドを実行する
+    →もしこれで高速化できるならばする
+    ls --time-style=+%s -lQLA
+    或いは、.cpp で実装してそれを remote でコンパイルする。
+    または、.pl で実装して実行する。等々。
+  ディレクトリの内容の更新を伝達する方法を調べる
+    隠しDokan関数
+      http://groups.google.com/group/dokan/browse_thread/thread/8271bc1d72dd924f/11d5a65053c4f930?pli=1
+      使用例: http://dokan.googlecode.com/svn-history/r170/trunk/sys/fileinfo.c
+      でも、これを .NET から呼び出す事ができるか?
+    SHChangeNotifyRegister をグローバルフックする?
+      http://eternalwindows.jp/shell/shellname/shellname06.html
+      http://msdn.microsoft.com/en-us/library/aa932924.aspx
+      でも、権限の問題がある。また、explorer がこれを使って観察をしているとは限らない。
+    接続待ち状態の間に昔の履歴を表示する
+      或いは "++ now connecting... ++" 等という名前の空のファイルを表示する。。。
+        でも、それだと一旦開いて表示してあるディレクトリの内容が一々消えるから駄目?
+        
+    と思ったら単にユーザプログラムの中から SHChangeNotify を実行すれば良いだけの様である。
+    こうすれば SHChangeNotifyRegister を実行している他の全てのプロセスに変更が伝達される。
+    これを実行する為には IDLIST かファイルのフルパスが必要。
+    IDLIST は Dokan ドライバの中に在るのかも知れないが、
+    自分で構築するのは大変なのでフルパスを使って指定する方が現実的であろう。
+    ファイルのフルパスは GvfsOperation か、それの上位の物体が知っている筈で、
+    FsBasic はこれらの上位のオブジェクトにパスを委譲すればよい。
+    その為には、FsBasic の初期化時にそれを伝達する為のデリゲートか何かを渡しておかなければならない。
+    
+
+20120317
+  時々遅くなる原因について観察
+    a. 複数のスレッドから同時に同じディレクトリを ls する際
+      この際は、どのスレッドでも query を発行する時点では stat_cache に cache が存在しない。
+      その為、三つ乃至は四つの全く同じ path に対する ls が、実際に実行に移される。
+      
+      同じパスに対する要求が二三回増えた所でそれ程時間が掛かるという訳でも無い筈だが、
+      特に複数のスレッドから同時に要求がある場合は、
+      ルートから子・孫まで順々に path を辿って ls が要求される様で、特に遅さが顕著に表れる様である。
+      
+      実際に、ls を lock(stat_cache) で全部囲んだ場合には、、
+      これが原因でそれ程の遅延が生じる事が無くなった様である。
+      然し、複数のスレッドで異なるパスを要求している場合には、同時に要求を出しても良い。
+      従って「現在他のスレッドで ls 中の path」がある場合には lock する様に変更すると良い?
+      
+      →面倒臭いので取り敢えず double-checked locking にする程度。
+        どうせ、ssh 接続は一本しかないのだから、multithread にしても余り意味無いだろう。
+        
+      →と思ったけれど、大量のファイルを含んでいるディレクトリにどれかのスレッドが
+        アクセスした場合には、その他のスレッドも長時間待たされる事になり、良くない。
+        やはり、複数のスレッドでアクセスできるようにして置いた方が良いのかも知れない。■
+        (但し、複数のスレッドにしたとしてもこれが解決するかどうかは分からない。)
+        
+    b. inputstream is closed でエラーになる
+      結構頻度が高い様な気がする。でも、ssh で接続が切れるなんて言う事がそんなに頻繁にあるとは思えない。
+      毎回、ChannelSftp.cs/ChannelSftp.fill() の中で発生する。Tamir.SharpSSH のバグじゃないか??
+      
+      調べると read は System.IO.Stream.Read をその儘呼び出し、
+      更に Stream.Read は buffer が溜まっていない時は、必ず 1 バイト以上溜まるまで待ってから制御を返す様になっているらしい。
+      <a href="http://msdn.microsoft.com/ja-jp/library/system.io.stream.read(v=vs.80).aspx">Stream.Read メソッド (System.IO)</a>
+      更に、Stream.Read は仮想関数であるが、実際に呼び出されているのは
+      <a href="http://msdn.microsoft.com/en-us/library/system.net.sockets.networkstream.read.aspx">NetworkStream.Read Method (System.Net.Sockets)</a>
+      の様である。こちらの説明にも、これ以上のデータがない場合に 0 を返すと書いてある。
+      
+      所が、実際に戻り値の値を確認してみた所 -1 を返してきている…これはどういう事か?
+      もしかすると、未だデータが届いていない、というだけの事かも知れないし、
+      或いは、本当に stream が閉じたという事かも知れない (でも、この場合は 0 を返すのでは??)。
+      
+      どう言う条件で起こるのか良く分からない。
+      もしかすると、一定の時間経過した後にこれが起こるのかも知れない。
+      
+      やはり -1 が返ってくるのは変なので、何処で実装されているのか調べる事にした。
+      なかなかエラーが起きないし、エラーの後に色々予期せぬオブジェクトの変更などがあって、
+      調べるのに無駄に時間を使ったが、漸く得たエラー情報は以下の通り。
+        ins.read(buff[32768],0,9) == -1
+        typeof(ins) == Tamir.SharpSsh.java.io.JStream
+        typeof(io.ins.s) == Tamir.SharpSsh.jsch.Channel+MyPipedInputStream
+      MyPipedInputStream は PipedInputStream から派生した物であり、殆どはこの基本クラスで実装されている。
+      ここで -1 を返しているのが一体どう言う状況なのかを調べれば宜しい。
+      :: dbg の為に jsch.ChannelSftp.fill() を書換 → 戻した ::
+      
+      -1 を戻すのは PipedInputStream.closedByWriter=true が設定された時だけ。
+      closedByWriter が設定されるのは、PipedInputStream.receivedLast が呼ばれた時だけ。
+      receivedLast が呼び出されるのは、PipedInputStream.close が呼ばれた時だけ。
+      結局、実際に接続が切断されている様子? である。
+      
+      どうやら、五分間経つと、Session.cs/Session.run() で、
+      1. 例外を受け取る
+      2. その場で catch して、接続を切断する
+      という事になっている様である。そして、接続が切断されても直ぐには通知が為されず、後になってエラーが発生する様子。
+      
+      そして、例外を投げているのは、jsch.Session.read(Buffer) である。
+      "invalid data" というメッセージが入っている。
+      どうやら、復号したデータの先頭にメッセージの長さが入っている様だが、それが負になってしまう様子。
+      複合したデータは buf.buffer=[236, 102, 126, 86, ...]; となっている。
+      この時、データの長さ j を以下の様に計算する。
+        j=ToInt(buf.buffer); // j=0xEC667E56=-328827306
+        j=j-4-cipher_size+8; // j=-328827310
+        if(j<0 || (buf.index+j)>buf.buffer.Length)
+        {
+          throw new IOException("invalid data"); // ここ
+        }
+      しかも、この時 j の値は固定ではない。例外が発生する毎に異なる値になっている。
+        invalid data length 1516120559 (384225148 before decryption)
+      また、j を復号する前の buffer の内容も何か特別な値を示している様には見えない。
+      :: dbg の為に jsch.Session.read(Buffer) を書換 → 戻した ::
+      
+      うーん。この辺りの処理は、SSH2 の Transfer Protocol で規定されている。
+      <a href="http://www.snailbook.com/docs/transport.txt">RFC4253</a> の 6. Binary Packet Protocol にあった。
+      ★ というか… 6.1 にはどの実装も 32KiB 以下の packet を正しく処理できなければならないと書いてある。
+          更に、packet の全部の長さが 35KiB になるかも知れない事も考慮に入れろとの事。
+          しかしこの jsch の実装を見ると buffer.Length 迄しか扱えず、buffer.Length = 20KiB になっている…。
+          いいのだろうか…。念の為、35KiB 迄既定のバッファのサイズを拡大しておく事にする。
+          @@ Buffer.cs/Buffer.Buffer
+             public class Buffer
+             {
+               static byte[] tmp=new byte[4];
+               internal byte[] buffer;
+               internal int index;
+               internal int s;
+               public Buffer(int size)
+               {
+                 buffer=new byte[size];
+                 index=0;
+                 s=0;
+               }
+               public Buffer(byte[] buffer)
+               {
+                 this.buffer=buffer;
+                 index=0;
+                 s=0;
+               }
+          -    public Buffer():this(1024*10*2){ }
+          +    public Buffer():this(1024*35){ } // mwg.20120318 (see RFC4253 6.1)
+               public void putByte(byte foo)
+      
+      [現状]
+      纏めると、データ長の復号に失敗する。
+      結局、解決する事は難しそうなので、如何に早く接続を復帰するかについて考えた方がよいのかも知れない。
+      例えば、予め二重に接続をしていて片方が落ちたら先に用意していた方に切り替える等…。
+      (でも、高が接続エラーの為にこれは大袈裟かも知れない…。)
+      
+      同じ事で悩んでいる人も結構いる…? 本当に同じかは分からないが。
+      <a href="http://groups.google.com/group/cozyroc/browse_thread/thread/309562cc73570062?pli=1">sFTP Error on File Transfer Attempt - CozyRoc | Google Groups</a>
+      <a href="http://sharpssh2.codeplex.com/discussions/248822">SharpSSH2 - View Discussion</a>
+      <a href="http://blog.gmane.org/gmane.comp.java.jsch/month=20100601">JSch is a pure Java implementation of SSH2. ()</a>
+      
+  c. シンボリックリンクの追跡が遅い
+    シンボリックリンクを追跡している間に 5 秒以上経過して、
+    すると、元々のディレクトリの ls を再度実行して…というのが延々と繰り返されている様子。
+    時刻判定は、シンボリックリンクを追跡し終わってからの経過時間でするべき。
+    
+    →これは P01 の実装の過程で取り込んだ。
+      一番初めに呼び出された IFsBasic の関数で System.DateTime.Now を取得し、
+      それを refrenceTime として子関数に渡し、
+      その referenceTime でディレクトリ構造キャッシュをクリアする様にした。
+      
+      また、それと同時に readlink の結果もキャッシュする様にしたら動作は改善した。
+      少なくとも充分の時間待てば正しくシンボリックリンクの追跡が完了する。
+      (とはいっても explorer が待ちきれずにエラーを報告して、ドライブを切断する事はある。)
+    
+  d. スレッド毎に Channel を保持する必要性はあるのか?
+    スレッド毎に Channel を保持している為、接続開始時と再接続時に、
+    複数の Channel を立ち上げる必要がありこれが体感速度の低下を招いている様に思われる。■
+
+  
+■機能
+
+A07. マウントが予期せず解除された時に再度マウントを実行する。
+  これは長時間応答できなかった時に自動的に windows によって閉じられる場合と、
+  一旦、スリープまたは休止状態になってから復元した時に起こる。
+  (スリープまたは休止状態になる時に、Dokan ドライバが windows 終了と勘違いするのだろうか?)
+  
+  定期的にドライブが存在しているかどうかを確認して、消えていたら再度マウントし直すという形で良い。
+  
+  因みにエクスプローラが落ちた時に右下の notify icon が消滅するので、
+  これについても定期的に確認して消えていたら登録するという事にした方が良いかも知れない。
+
+A06. それぞれのアカウントを無効にするオプションを追加する。
+
+  これは P01 の書換の途中で実装したが、
+  sftp アカウントの設定項目の一つとして実装してしまった。
+  しかし、良く考えたらこの設定項目は sftp アカウントに限った話ではなくて、
+  どのファイルシステムアカウントでも欲しい設定項目である。
+  
+  設定項目の位置にも違和感を覚える。
+  なので、何れ設定項目の扱いをファイルシステム一般にできると良い。
+  例えば IFsAccount に Enabled プロパティを追加するなど。
+
+A05. 現在の接続状態を見られる様にする。
+  また、ログも見られる様にする。
+  
+  刻々と現在の状態を表示する為のウィンドウを作成する。
+  インターフェイスとしては、右下のアイコンから起動できる様にするだけで OK。
+  
+  現在の状態はどの様に取得する事ができるか…。
+  しかし、notify icon からアンマウントが実行できるのだから、
+  当然現在の状態を取得する事は簡単の筈である。
+  
+  →実際に見てみたが、現在マウントしているファイルシステム一覧を取得するのは簡単である。
+  しかし、良く考えてみたら一般的になる様に作ってきたので、
+  そこの一覧にあるファイルシステム達がそれぞれ sftp なのかどうなのか分からない様になっている。
+  つまり、接続の一覧と言うよりはファイルシステムの一覧にしかならない。
+  
+  勿論、ファイルシステムの一覧もあった方が良いが、
+  接続の一覧画面も欲しいと言う所。
+  現在確立している接続の一覧も欲しい。
+  session.Sftp プロパティで再接続などを実行したりするのだから、
+  session 一覧画面を表示して其処で現在接続を確立しているかどうかを見るというのはどうだろう。
+  →取り敢えず session 一覧で良い気がする。
+  
+  session 一覧をするとしたら何を表示すると良いだろう。
+  + 合計
+  + 接続試行回数
+  + データ書込量
+  + データ受け取り量
+  + 最高速度/現在の(最近の)速度/現在速度÷最高速度パーセント表示
+  + 接続継続時間/アイドル時間 (前回の sftp 使用からの経過時間)/接続切断までの時間/累計接続時間
+  + 操作回数 (sftp 使用回数)
+  + スレッド数/最高スレッド数
+  
+  後、これは sftp 特有の物であって、その他の接続の種類の場合には表示項目も変わってくると思う。
+  また、項目が多くなってくると横に表が伸びて見辛い。どの様に表示するのが一番適当だろうか。
+  →似た様な項目については縦に並べて表示すると良いだろう。
+  
+
+A04. cygwin chmod
+  cygwin から見ると permission がいつも固定である。
+  通常ファイルは 644, ディレクトリとショートカットは 755, ...。
+  .exe ファイルも自動で 755 となっている様子である。
+  ls をする瞬間に何かそれを決定する為の呼び出しが為されるかとも思ったが、
+  何回か GetFileInformation が呼び出された以外は何もされていない様子。
+  また、chmod をしてみたが、CreateFile で \...\memo.txt\ を開こうとした以外に、
+  何か特別な事は実行しようとしていない。
+  
+  ファイルシステムの種類を見て cygwin が初めから permission 取得を諦めているか、
+  Dokan のデバイスドライバ内部で処理されて DokanOperations に到達する前に握りつぶされているか、
+  巧妙な方法を用いてファイルの permission に関する情報を取得・設定しようとしているか。
+  
+  取り敢えず GetFileInformation が何度も実行されるのが気になる。
+  数えてみたら一度の ls で 15 回も GetInformation が呼び出されている様子である。
+
+A03. ファイル名の特別文字
+
+  1.Cygwin 特別文字 [完]
+
+  2.私用領域の文字との衝突について □
+    現在の実装だと、本当に私用領域の文字を使って名前が付けられているファイルに対してアクセスできなくなる。
+    触ろうとしても特別文字を使ったファイル名のファイルを操作しようとするからである。
+    例えば、"/home/user/a\uF03Ab.txt" という名前のファイルを触ろうとしても、
+    "/home/user/a:b.txt" というファイルへの操作と解釈されてしまう。
+    
+    例えば、"/home/user/a:b.txt" というファイルに対する操作が失敗したら、
+    "/home/user/a\uF03Ab.txt" というファイルに対する操作として再度試すという手もある。
+    しかし、この手法は "::::::::::.txt" 等の様に特別な文字を沢山含むファイルに
+    対する操作が失敗した時に、2 の累乗で処理時間が増大する虞がある。
+    →しかし、そのディレクトリに存在しているファイル一覧から
+      一致するファイルを探すだけならばそんなに大変ではない。
+    
+    つまり、特別な文字を含むファイルの操作に失敗したら、
+    ファイル一覧の中から私用領域の文字を含む物に対して一致を試みて、
+    一番初めに一致した物に対して再度ファイルの操作を実行すれば良い。
+
+  3. '.' で終わるファイル名について [notepad.exe のバグ]
+  
+  4. '*' や '?' を含むファイル名について [完]
+    Tamir.SharpSSH の実装を見ていたら、* や ? を含むファイル名の場合、
+    Tamir.SharpSSH の内部で glob 解決を実行していた様子である。
+    つまり、SFTP が * や ? を含むファイルを扱えないのではなく、
+    Tamir.SharpSSH が * や ? を含むファイルを扱えないだけであった。
+    
+    なので、* や ? の解決を実行しない version の関数を ChannelSftp に加えていけば、
+    * や ? を含むファイル名について扱う事が可能になると思う。
+    取り敢えず SETSTAT については setstat_glob という関数で操作できる様にした。
+    (元々はリモートに適用する属性を明示的に指定する為に setstat を書き直したのだが。)
+  
+    と、思ったら * や ? は \ でエスケープしておけば展開として扱われない様子である。
+    然し、キャッシュなどとの整合性を保つ為には ls の結果の getFilename に * や ? が含まれていた場合に、
+    これらを \* や \? になる様に変換をする必要性がある。
+    →getFilename で * や ? に \ を加えるようにした所、
+      * や ? を含むファイルを正しく表示できる様になったが、
+      今度は \ を含むファイル名が unix では許されている事に気付く…。
+    Tamir.SharpSSH ではこの様なファイルには対応していないのだが…。
+    
+    仕様がないので、やはり \ を使ってワイルドカードを誤魔化すのは止めて、
+    \ も私用文字にマッピングする事にした。やはり Cygwin は \ を私用領域にマッピングしても認識していない様だ。
+    試しにディレクトリを作ってみたが、私用領域の文字で表示される。中に入る事はできるが ls はできない (SharpSSH で対処していないので)。
+    然し、不思議な事に GNU screen はカレントディレクトリにが \ が含まれているという事を認識している様子でもある…?
+    
+    rm -> noglob_rm
+    rmdir -> noglob_rmdir
+    mkdir : 中を覗くと何故か元から noglob になっている気がする。\ の unquote も行っていない。
+      →仕様がないので、オリジナルの mkdir に unquote を追加して、
+        新しく noglob_mkdir を作成した。
+    stat -> noglob_stat
+    ls -> noglob_ls
+      ls の書換中に変な事をして一瞬動かなかったけれど、直ぐに直して動く様になった。
+    readlink -> noglob_readlink
+    get -> noglob_get
+    put -> noglob_put
+    
+    これで * や ? がファイル名に入っていても正しく扱える様になった。
+    また、更に、\ がファイル名に入っていても、私用領域の文字に化けてはいるが正しく扱える様になった。
+    
+
+A02. シンボリックリンク処理
+  現在、シンボリックリンクは、普通のファイルとして表示するかリンク先に解決するかしている。
+  もっと選択肢を広げても良いのではないだろうか?
+  + cygwin の symlink として表示する場合
+    →これは P01 書込キャッシュ実装の前座としてコードを整理した時に実装した。
+      今迄通常ファイルとして表示していた物を、cygwin symlink として表示する様にした。
+      
+      今迄は、通常ファイルとして内容を読んだ時に、
+      リンク先のファイルの先頭数十バイトが読み込まれてしまった。
+      現在は cygwin の認識する symlink ファイル (特別なファイル) の内容を返す様にした。
+      更に、今迄は書込を行った場合に到ってはリンク先のファイルに内容が書き込まれてしまう事になっていたが、
+      現在は書込を禁止している。
+      
+  + windows ショートカットとして表示する
+    例えば、
+    1 windows の API で temp ディレクトリにショートカットを作成し、
+    2 そのショートカットの名前を変更して通常ファイルに戻し、
+    3 中身を読み取ってそれを表示しているファイルの中身とする。
+    これは結構面倒である。ショートカットのフォーマットが公開されていればそれがよいのだが。
+    
+    <a href="http://webcache.googleusercontent.com/search?q=cache:Rp0Y2xI2aKoJ:yowaken.dip.jp/tdiary/20060829.html+windows+%E3%82%B7%E3%83%A7%E3%83%BC%E3%83%88%E3%82%AB%E3%83%83%E3%83%88+%E3%83%95%E3%82%A9%E3%83%BC%E3%83%9E%E3%83%83%E3%83%88&cd=1&hl=ja&ct=clnk&gl=jp">xe-kdoo(2006-08-29)</a>
+    
+    <div class="note">引用)
+      <h3><span class="sanchor">&gt;&gt;</span> [<b style="color:black;background-color:#ffff66">Windows</b>][Memo] <b style="color:black;background-color:#a0ffff">ショートカット</b> (*.lnk) のファイル<b style="color:black;background-color:#99ff99">フォーマット</b></h3>
+      <p>Meadow が .lnk を追ってくれないので<span class="footnote" title="3.0 では対応するらしい？">*1</span>
+      何とかできないかなあ、と思って調べた。
+      </p>
+      <ul>
+      <li><a href="http://www.stdlib.com/art6-Shortcut-File-Format-lnk.html">Shortcut File Format (LNK)</a></li>
+      <li><a href="http://romitechio.com/log/archives/2005/05/lnk.php">(rc*) ロミテチオ・ログ: .lnk ファイル解析</a></li>
+      <li><a href="http://www.i2s-lab.com/Papers/The_Windows_Shortcut_File_Format.pdf">[PDF] The_Windows_Shortcut_File_Format.pdf</a></li>
+      </ul>
+      <p>どうやら公式なドキュメントはないらしい。
+      </p>
+      <p>上記ドキュメントには書いてないけど、どうやら Shortcut flags の bit7 にも
+      意味がありそうだ。
+      </p>
+      <ul>
+      <li>Description 以降、一文字が 2 バイトですよフラグ</li>
+      </ul>
+      <p>のような気もするし、さらに
+      </p>
+      <ul>
+      <li>末尾に（謎の）余分なデータがついてますよフラグ</li>
+      </ul>
+      <p>にも見える。後者はリンク先のパスを得るには関係なさそうなので無視するけど。
+      </p>
+      <hr>
+      <ul>
+      <li><a href="http://centaur.maths.qmul.ac.uk/Emacs/files/w32-symlinks.el">w32-symlinks.el</a>: Provides support for <b style="color:black;background-color:#ffff66">Windows</b> symbolic links, including <b style="color:black;background-color:#ffff66">Windows</b> shortcut files and Cygwin  shortcut and (obsolete) symlink files.</li>
+      </ul>
+    </div>
+    
+    <a href="http://ithreats.net/2009/05/27/window-shortcut-lnk-file-format/">Window Shortcut – LNK File Format « iThreats</a>
+    <a href="http://aki.issp.u-tokyo.ac.jp/itoh/hiChangeLog/html/2007-03.html">hiChangeLog / 2007-03</a>
+    <a href="http://code.google.com/p/8bits/downloads/detail?name=The_Windows_Shortcut_File_Format.pdf">The_Windows_Shortcut_File_Format.pdf - 8bits - The Windows Shortcut File Format (Jesse Hager) - Open source documentation and tools as described on http://stam.blogs.com - Google Project Hosting</a>
+    <a href="http://ithreats.files.wordpress.com/2009/05/lnk_the_windows_shortcut_file_format.pdf">The_Windows_Shortcut_File_Format.pdf</a>
+    <a href="http://www.wotsit.org/list.asp?al=L">Wotsit.org - Extensions: 'L'</a>
+    
+    どうも指し示している先のファイルの種類や、日付などの属性もショートカットファイルの中に含まれているらしい。
+    という事は Windows ショートカットとして表示するとしても、追跡先の情報を読まなければならない事になる。
+    これは決して軽い操作ではない。■
+    
+    試しに適当に作ってみたが、相対パスだけの適当なショートカットでも一応動作する様子である。
+    
+    更に、リンクに対するリンクの扱いができるかどうかを確認しておく必要がある。
+    →リンクに対するリンクの扱いは面倒。というのも、.lnk を付加しなければならないから。
+      それよりは完全にリンク先を決定してから、それに対する相対パスをショートカットに入れる方が楽。
+    
+    
+    + リンク先に解決
+  
+  
+A01. 鍵認証への対応 [完]
+
+OA01. 引数処理
+OA02. DataGridView のセル描画が無意味に複雑になっていたので書き直し。
+OA03. 保存形式の一般化
+OA04. TimeoutExecutor の利用
+
+■問題点
+
+B14. ls の重複 [完]
+
+B13. 接続切断時に Session.run() から例外が発生している。
+  →接続を切断しているはずなのに、session.run() が動いている??
+    後で止める方法について調べて止める様にする。
+    SshSessionBase.cs/SshSessionBase.Disconnect
+
+  [20120730]
+  接続を切断する時に一々例外が発生する。
+  これは、主接続を切断する時に<del>子 channel のスレッド</del>自身の読み取りスレッドを停止していないのが原因である。
+  <del>子 channel の</del>スレッドは Session._isConnected を参照して、それが true である限り読み取りを継続する。
+  一方で、Session.disconnect 関数は、Channel を全て閉じ終わってから _isConnected を false に設定する。
+  
+  試しに、_isConnected を Channel を閉じる前に false に設定してみた。
+  しかし、それでも例外は発生した。当たり前と言えば当たり前である。
+  _isConnected を確認してから、SSH_MSG を読んでそれから色々な読み取り動作を実行するので、
+  _isConnected を確認してからも暫く読み取りが継続される事になるのが理由である。
+  
+  それに、_isConnected の位置を変更した事による弊害が今後出ても嫌なので、
+  やはり _isConnected に false を代入する位置は元に戻して、
+  Channel の方で _isConnected=false の時には例外を無視するなどの変更を加えた方が安全である。
+  
+  というか、コードを探してみても主スレッドの Interrupt はしても、Abort は何処でもしていない。
+  スレッドは、自発的に終了するか読み取れないストリームを読み取ろうとして例外で終了するかしかないのか。
+  或いは Interrupt でスレッドが終了するのだろうか
+  →調べてみたら java では Thread.stop() でスレッドが急停止するため終了処理をする事ができず、
+    代わりに何らかのフラグ変数で停止するか、interrupt 関数で停止するかしかないらしい。
+    interrupt は .NET の Interrupt と同じで、sleep 等の状態に在る時に限って例外を発生させる物である。
+    なので、実質 interrupt は abort に置換しても構わないのではないかと思う。
+  
+  と言う事で interrupt を abort に書き換えて、
+  更に ThreadAbortedException 及び ThreadInterruptedException を捕まえてみる事にした。
+  →しかし、何らかの操作をしている途中にこれが起こったらどうなるのか?
+    何か変な事になったりはしないだろうか。。。
+    一応 Thread.abort を呼び出す前に Channel は全て閉じられている筈であるが…。
+
+B01. ファイルの日時を設定する時に九時間進んでしまう [完]
+B02. ファイル名付け替えとキャッシュ [完]
+B03. 接続が切れた時に、再接続が為されない [完]
+B04. 名前を変更した時にファイル一覧内容が反映されない [完]
+B05. 異なる物理ディスクにマウントされたディレクトリ間でのファイルの移動が出来ない [完]
+B06. 終了時、わざわざ接続してから切断する [完]
+B07. un001.ecc で root directory の stat が異常に遅い [完]
+B08. アカウントデータの保存 [完]
+B09. キャッシュの即時性の確保 [完]
+B10. ファイルを送信すると、何度も失敗・再接続を繰り返しながら進む [完]
+B11. 何故か既に存在するファイル名に一見して変更出来てしまう。 [完]
+B12. 何故か、自動切断時間の設定を保存しても反映されない。[完 2012/02/17 06:42:21]　　　

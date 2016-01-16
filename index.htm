@@ -1,0 +1,135 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+<?xml version="1.0" encoding="utf-8"?>
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+  <meta http-equiv="Content-Style-Type" content="text/css" />
+  <link rel="stylesheet" type="text/css" charset="utf-8" href="http://padparadscha/agh/mwg.std.css" />
+  <title>MyogaUlexite</title>
+</head>
+<body>
+<h1>MyogaUlexite</h1>
+<h2>概要</h2>
+<p></p>
+<h3>類似のソフトウェア</h3>
+<ul>
+<li>DokanSSHFS
+  <ul>
+  <li><a href="http://dokan-dev.net/docs/dokan-sshfs-readme/">Dokan » Dokan SSHFS</a></li>
+  <li>SFTP/Dokan</li>
+  </ul>
+</li>
+<li>NekoDrive
+  <ul>
+  <li><a href="http://code.google.com/p/nekodrive/">nekodrive - NFS for Windows made easy - Google Project Hosting</a></li>
+  <li>NFS/Dokan</li>
+  </ul>
+</li>
+<li>SFTP Net Drive
+  <ul>
+  <li><a href="http://www.forest.impress.co.jp/docs/review/20111110_489324.html">窓の杜 - 【REVIEW】SFTPサーバーを仮想ドライブとしてマウントできるフリーソフト「SFTP Net Drive」</a></li>
+  <li><a href="http://www.eldos.com/sftp-net-drive/">Access remote disk over net using SFTP protocol and map it to local drive letter - SFTP Net Drive</a></li>
+  <li><a href="http://gigazine.net/news/20130120-sftp-net-drive/">SFTPをWindowsのドライブとしてマウントするフリーソフト「SFTP Net Drive」 - GIGAZINE</a></li>
+  </ul>
+</li>
+<li>
+  <ul>
+  <li><a href="http://gigazine.net/news/20121108-netdrive/">FTP・WebDAVをWindowsのローカルドライブとして扱えるフリーソフト「NetDrive」 - GIGAZINE</a></li>
+  </ul>
+</li>
+</ul>
+
+<h2>機能</h2>
+<ul>
+<li>接続について
+  <ul>
+  <li>多段接続
+    <p>gateway を通して SFTP サーバに接続する事が可能です。
+    つまり、例えば ssh server1 -&gt; ssh server2 -&gt; ssh sftpserver
+    として入る事の出来る sftpserver の内容にアクセスする事ができます。
+    接続の段数は何段でも増やせます (但し、当然ですがその分動作は遅くなります)。
+    </p>
+  </li>
+  <li>自動接続・切断
+    <p>使用していない時は自動で接続を切断します。
+    最後に使用してから切断に到るまでの時間を指定する事が可能です。
+    また、切断時に使用しようとすると自動的に再接続をします。
+    </p>
+  </li>
+  <li>Heartbeat 送信
+    <p>長時間使用していないが接続状態を維持したい時、
+    接続を保持する為に空のメッセージをサーバに送信します。
+    長時間通信がないと NAT Entry が失われる場合に利用できます。
+    Heartbeat の間隔を指定する事が可能です。</p>
+  </li>
+  <li>エラー時の再接続
+    <p>接続のエラーによって操作に失敗した時、
+    自動的に再接続をして再度同じ操作を試行します。
+    一つの操作に対する再接続の最大試行回数を指定する事が可能です。
+    </p>
+  </li>
+  </ul>
+</li>
+<li>キャッシュ機能
+  <p>動作を高速にする為にキャッシュ機能を備えています。</p>
+  <ul>
+  <li>書込プロテクト
+    <p>内容を閲覧するだけで変更操作を実行したくないサーバについては、
+    読込専用の設定を適用する事ができます。</p>
+  </li>
+  <li>ファイル情報のキャッシュ
+    <p>取得したファイル情報をキャッシュする設定を選択できます。
+    最新の情報が手許にある場合には、キャッシュされた情報を使用します。
+    手許の情報が古くなっている場合には、再度取得を試みます。
+    (現在は 5 秒で情報の期限が切れる設定にしています。)
+    </p>
+  </li>
+  <li>ファイル内容の読込キャッシュ
+    <p>ファイル内容の読込をキャッシュする設定を選択できます。
+    既に読み込んだ内容はローカルにキャッシュします。
+    リモートへの要求は 4KiB のブロック単位で行われ、
+    小さい要求が大量に実行されるのを防ぎます。
+    また、シーケンシャルにアクセスしている場合には先読みを実行します。
+    (リモートでファイル内容が更新された場合は、
+    ファイル時刻でそれを検出しキャッシュを破棄します。)
+    </p>
+  </li>
+  <li>変更操作のキャッシュ
+    <p>ファイルの移動、削除、ファイルへの書込などの操作をキャッシュする設定を選択できます。
+    大量のデータを書き込んだり大量のファイルを移動した場合などはリモートの更新に時間が掛かりますが、
+    この設定を有効にしておくと手許では恰も操作がすぐに完了した様に見せて、
+    バックグラウンドで時間をかけて更新をリモートに適用します。
+    </p>
+  </li>
+  </ul>
+</li>
+<li>ファイルシステム
+  <ul>
+  <li>複数の接続先
+    <p>複数の接続先を指定する事ができます。</p>
+  </li>
+  <li>シンボリックリンク
+    <p>リモートのシンボリックリンクの表示の方法を選択する事ができます:
+    i) 恰もファイル・ディレクトリ本体が其処にあるかの様に表示します。
+    ii) 或いは、Cygwin の symlink ファイルとして表示します。
+    </p>
+  </li>
+  <li>ファイル名の特殊文字
+    <p>* や &lt;, &gt; や ? など特別な文字を含んだファイル名が Unix 系 OS で使われている可能性があります。
+    その様なファイルに対しても、特別な文字を Unicode 私用領域の文字に対応させるので、適切に操作を行う事が可能です。
+    この動作は Cygwin に倣った物です (Cygwin アプリケーションからは特別な文字のファイル名として操作ができます!)。
+    </p>
+  </li>
+  <li>ZoneID (改良予定)
+    <ul>セキュリティの為に ZoneID を設定しています。
+    (■予定: ZoneID を設定画面で変更できる様にする予定です)
+    </ul>
+  </li>
+  </ul>
+</li>
+</ul>
+
+
+
+</body>
+</html>

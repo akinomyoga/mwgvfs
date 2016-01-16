@@ -1,0 +1,12 @@
+# generated files
+/obj
+/bin
+
+# mat
+/Materials
+
+# test
+/Resource/test
+
+
+#\!*

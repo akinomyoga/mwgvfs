@@ -1,0 +1,2005 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ja">
+<head>
+  <title>MwgSSHFS 更新・修正履歴</title>
+  <meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+  <meta http-equiv="Content-Style-Type" content="text/css" />
+  <meta http-equiv="Content-Script-Type" content="text/javascript" />
+  <link rel="stylesheet" type="text/css" charset="utf-8" href="http://tkynt2.phys.s.u-tokyo.ac.jp/~murase/mwg3/mwg.std.css" />
+  <link rel="stylesheet" type="text/css" charset="utf-8" href="http://tkynt2.phys.s.u-tokyo.ac.jp/~murase/mwg3/prog.std.css" />
+  <meta name="Mwg-Kick-Type" content="text.color" />
+  <script type="text/javascript" charset="utf-8" src="http://tkynt2.phys.s.u-tokyo.ac.jp/~murase/mwg3/mwg.kick.js"></script>
+  <style type="text/css">
+  h1{font-family:"Times New Roman","MS PMincho"}
+  pre.js{background-color:white;padding:1ex;}
+  pre.css{background-color:white;padding:1ex;}
+  hr{height:1px;}
+  </style>
+</head>
+<body>
+<h1>MwgSSHFS 更新・修正履歴</h1>
+<!--########################################################
+
+          計画01
+
+#########################################################-->
+<h2>P01. 20120720 書込キャッシュ</h2>
+<p>取り敢えず write cache が実用的かどうかにしろ実装してみたい</p>
+
+<h3>1. 考察: 現在の構造 [20120720]</h3>
+<p>現状の FsOperation 実装の構造</p>
+<p>しかし、現状の FsOperation はキャッシュ機能などの実装場所が複雑になっていてよく分からない。
+どんな機能が何処に実装されているかを先ず始めに整理する必要がある。
+そして他のファイルシステムにも応用出来そうな所は分離可能にするし、
+現在の filesystem に特化した機能で他のファイルシステムに応用出来そうにない物は止める。
+</p>
+<ol style="list-style-type:upper-alpha;">
+<li>エラーが起こった時に再度試行する機能
+  <p>SftpFsOperation.gen.cs</p>
+</li>
+<li>実際の実装の詳細
+  <p>SftpFsOperation.cs</p>
+</li>
+<li>読込キャッシュ
+  <p>RemoteFsCache.cs</p>
+  <p>RemoteFsDefs.cs</p>
+  <p>これは、現状の実装では ReadData に介入しているのみである。
+  DataCache オブジェクトの内部で「File」というオブジェクトでキャッシュを管理している。
+  FsOperation から利用する場合には FsOperation のメソッドの中から
+  DataCache オブジェクトの ReadData 関数を呼び出している。
+  </p>
+  <p>FsOperation として要求されているのは IRemoteFsOperation を実装している事である。
+  特に現在使用している物は、FileGetSize, FileGetMTime, ReadData である。
+  これらは SshFs に特有の物でもないので、他の FsOperation からでもキャッシュの機能は利用できそうに思う。
+  </p>
+  <p>また、FsOperation の実装の詳細で要求されている事は、</p>
+  <ul>
+  <li>ReadData と WriteData を DataCache オブジェクトを介して実行する事と、</li>
+  <li>適切な時に DataCache オブジェクトを Dispose する事、</li>
+  <li>それから「ファイルを閉じるタイミング」を DataCache オブジェクトに通知する事である。
+    これは読込キャッシュしたデータを解放する時刻を決定する為の物である。
+  </li>
+  </ul>
+  <p>また、ファイルを閉じるタイミングを FsOperation 側で管理しているのは、
+  ディレクトリ構造のキャッシュも FsOperation 側で実装している為である。
+  </p>
+</li>
+<li>ディレクトリ構造のキャッシュ
+  <p>これは可成り広範な範囲に亙って実装が分散している。
+  というのも、ファイル属性や日時などの情報は sshfs 本体の実装でも頻繁に利用するからである。
+  sshfs 本体からファイル属性や日時などの情報を取得する際にもディレクトリ構造のキャッシュは利用したいが、
+  sshfs 本体のメソッドを直接書き換える訳には行かないし、
+  といって fsoperation のクラス毎に override するのでは効率が悪い。
+  </p>
+  <p>これがコードが汚くなる原因を作っている様なので、構造を考え直した方が良いかも知れない。</p>
+</li>
+</ol>
+
+<!--************************************************************************-->
+<h3>2. 考察: 実装方法 [20120720]</h3>
+<p>機能を拡張する一般的な手法としてどの様な方法があったか。</p>
+<ol style="list-style-type:upper-alpha;">
+<li>仮想関数
+  <p>これだと機能を有効にする為に一々クラス毎に派生クラスを作成しなければならない。
+  色々な機能を有効にしたり無効にしたり、或いは、それらを動的に変更するのには向かない。
+  </p>
+</li>
+<li>委譲
+  <p>機能を色々なメンバーオブジェクトに委譲する。これは現在の実装に近い。
+  しかし、委譲をする親のクラスの実装は一つに限定されてしまう。
+  現在は sshfs が親のクラスになっている所為で、その他の種類の fs の場合に対応しにくい状況になっている。
+  </p>
+</li>
+<li>Wrapper
+  <p>thin wrapper として機能に少し介入をする。
+  これは外部から介入する物である為、内部の実情に依存せず純粋に general に機能を実装できる。
+  しかし、逆にその所為で、内部の実情に合わせた凝った事はできない。
+  </p>
+</li>
+</ol>
+<p>やはり現状の委譲による実装が一番現実的な様に見える。
+しかし、現在は sshfs ベースでこれを実装してしまっている為に、
+sshfs に依存した汚い実装に見えているのである。
+(とは言っても、委譲によって機能を親で混ぜるという方法は、
+やはり汚くなってしまうのは仕方が無い気はする。)
+</p>
+
+<h3>3. 実装: sftp 依存部分の分離</h3>
+<p>取り敢えず、現在の実装から sshfs 的成分を分離する事ができるかどうかについて試してみる。</p>
+<ul>
+<li>SftpFileCache は jsch に依存している。
+  <p>→新しく使いそうな情報を保持する FileInfo クラスと、
+  それをキャッシュデータとして持つ Cache を作成した。
+  </p>
+</li>
+</ul>
+
+<!--************************************************************************-->
+<h3>3. 実装 [2012/07/27]</h3>
+<p>設計の構造としては SFTP 等のファイルシステムに依存する部分は IFsBasic として実装して、
+大体共通の処理となるであろう部分と全体の統御については GvfsOperation で実装する形にした。
+</p>
+<p>取り敢えず分離は完了した。その上で再度考え直してみる。
+</p>
+<ol style="list-style-type:upper-alpha;">
+<li>先ず、ディレクトリ構造のキャッシュについて。
+  <p>初めの考察でこれの周りが汚いという事を思ったが、
+  整理によって GetFileInfo という関数で統一的にファイルの情報を取得させるようにしたため、
+  可成り綺麗になったと考えている。
+  </p>
+  <p>これはディレクトリ構造をどの様に取得できるかに依存する。
+  sftp の場合には、ls を実行すればそのディレクトリに属するファイルの全ての情報が得られる。
+  しかし、ftp や圧縮ファイルなど別の媒体に対しては、
+  </p>
+  <ul>
+  <li>ls で得られるのはファイル名一覧だけかも知れないし、</li>
+  <li>或いは、一発で全てのディレクトリと中のファイルの情報を取得する事ができるかもしれない</li>
+  </ul>
+  <p>その為、[ls でファイルの情報を取得する] というインターフェイスを要求する事は汎用性に欠ける。
+  それよりは本当に必要とする機能として [ファイルの情報を取得する] と
+  [ディレクトリの中にあるファイルの情報を取得する] という二つのインターフェイスを要求し、
+  それを遂行する上で得られる情報を (副次的な情報も含めて) 自分でキャッシュさせる様にした方が良い。
+  そして、キャッシュ自体の実装は汎用的に使える物を一つ用意して、それを使って貰う事にする。
+  </p>
+</li>
+<li>読み取りのキャッシュについて
+  <ul>
+  <li>元々の設計は IRemoteFsOperation インターフェイスを受け取る様になっていた。
+    今回は色々の操作は全て IFsBasic で実装する事にした一方で、
+    IRemoteFsOperation は DokanOperations から派生している為、
+    既存の実装を利用する為に現在は無駄なアダプタを実装している。
+    <p>しかし、読み取りをキャッシュするだけであるならば
+    IFsBasic の機能だけで充分であるはずなので、
+    IFsBasic を利用する様に書き直すとよりすっきりすると考える。
+    </p>
+  </li>
+  <li>既存の書込キャッシュ様インターフェイスは駄目なので、削除して良いと言う事。
+    現在の設計では、読み取りと書込の両方を意識しているが
+    実際には読み取り部分しか実装をしていない。
+    更に、書込の部分は不完全である為、現在の設計では書込を実装する事ができない。
+    (書込以外の、属性設定やファイルの移動・削除との衝突を考慮していない)
+  </li>
+  </ul>
+  <p>現状では既存の実装をアダプタを通して利用しているが、
+  以上の理由から再度書き直したいと考えている。
+  →取り敢えず書き直した。簡単に書き直すつもりだったのが大幅な書換になった。
+  然し、結局 IFsBasic アダプタとして読み取りキャッシュを実装する事ができたので、
+  結局、コードは綺麗になったし却って良かったのではないかと思う。
+  </p>
+</li>
+<li>接続エラーに際して再度試行する機能
+  <p>現在の実装では接続エラー及び不明なエラーの際には、
+  例外を発生する事によってその事を GvfsOperation に伝える仕組みになっている。
+  GvfsOperation 側では例外の種類を判定する事によってそれが接続エラーであるのか、
+  それとも異なる種類の(再接続しても直らない)エラーであるのかを判定している。
+  </p>
+  <p>しかし、その例外の判定は sftp 等の実装依存である。
+  従って、例外の補足と通知は IFsBasic の方で実装するべきである。
+  また、ログ出力のクラスで (エラー出力の序でで) エラーの判定を行っているが、
+  これは適切な実装ではない (エラーの判定部分は全然共通なコードでない。)
+  </p>
+  <p>その辺りを含めて書き直したい。
+  現在はコードが分散しがちなので、色々と見て回らないと修正できないかもしれない。
+  →書き直した。B よりは簡単に書き直せたと思う。
+  </p>
+</li>
+</ol>
+
+<!--************************************************************************-->
+<h3>4. リンクの動作確認 [2012/07/28]</h3>
+<p>リンクの扱いについて確認しておきたい事がある。
+リンクに対して書込を実行するとどうなるか?
+SFTP インターフェイスの動作に応じて、
+実装を考え直さなければならないかも知れない。
+</p>
+
+<ol style="list-style-type:lower-alpha;">
+<li>リンクファイル自体の中身が書き換わるのであれば、
+  読込・書込はリンク先に対して実行する必要がある。
+</li>
+<li>自動的にリンク先の読み書きに変換されるのであれば、
+  「リンクを通常ファイルとして表示」している時に、
+  書込は禁止して、読み取りは readlink で実行する必要がある。
+  今迄特に考慮しなくても動作してきた事を考えると、こちらの動作になっていると思われる。
+</li>
+</ol>
+
+<p>emacs で試してみた所、emacs は現在のファイルを xxx~ に移動してから、
+新しく xxx というファイルを作成してそれに書込を実行するという仕組みである為に、
+変な事になってしまった。emacs にとって見れば、それがシンボリックリンクであるならば、
+シンボリックリンクとして表示されないと正しく処理されないという事である。
+</p>
+<p>今度はバックアップファイルを残さない vi で試したらどうなるだろうと思ったら…
+実は vi も瞬間的に xxx~ に移動して xxx に書込が終了してから、xxx~ を削除する様である。
+書込の最中にクラッシュしたときのためであろうか。
+</p>
+<p>今度は windows のメモ帳で開いてみた所、b. の方であった。
+つまり、リンク自体は書き換えられずに、リンクの指し示している先のファイルが書き換えられた。
+</p>
+<p>結局、cygwin を使用するのであれば、勝手にリンク先ファイルに解決して表示するよりは
+cygwin symlink として表示した方が良い。
+cygwin を使用しないのであればリンク先に解決して通常ファイルとして表示した方が使い勝手がよさそう?
+</p>
+<ul>
+<li>しかし、emacs や vi の様に通常ファイルだと思って操作して変な事になる可能性もあるので、
+  本来はショートカットとして表示した方が良いのかも知れない。
+  <ul>
+  <li>でも、変な事と言うのは symbolic link としては変な動作になると言うだけであって、
+  飽くまで通常ファイルとして見るのであれば表面上何の問題も出てこない。 (symlink 機能が働かないだけで。)</li>
+  </ul>
+</li>
+</ul>
+<p class="resume">取り敢えずショートカットとして表示する機能も追加しておくと良いかも知れない。</p>
+
+<p class="marked">★ [結論]</p>
+<ul>
+<li>cygwin を利用するのなら、cygwin symlink</li>
+<li>cygwin を使わないのならばリンク先に解決</li>
+<li>ショートカットは便利か分からないが、余裕が有れば実装□</li>
+</ul>
+
+<h4>4.1 リンクを正しく実装する為に FileInfo を override する</h4>
+<ul>
+<li>override して利用する事にしてしまえば、InternalObject プロパティは不要である。[完]</li>
+<li>cygwin link は相対パスを計算する様にする。[完]</li>
+</ul>
+
+<h4>4,2 readlink キャッシュを実行する</h4>
+<p>動作が遅くなっている原因の一つである。
+リンクの中身の変更が行われていないという保証が取れれば、再度 readlink を実行する必要はなくなる。
+ls で link の modified time が取得できていれば問題ない。
+</p>
+<p>実装した。恐らく正しく動作している。
+これでリンクが沢山あるディレクトリの情報を取得する時の動作が、少しは増しになったと思う。
+とはいっても初回のアクセスではやはり重くて開けない事も多い。
+</p>
+
+<h4>4.3 ls の extended information には何が含まれているのか確認する。</h4>
+<p>もしかして改めて readlink しなくてもリンク先の情報が取得できているかもしれない…
+そうすれば初回・二回目以降を問わずリンクが沢山入っているディレクトリを閲覧する事ができるのだが…。
+</p>
+<p class="marked">→ 確認してみたが extended なデータはそもそも送られてきていない様である。デバグ用のコードは始末。</p>
+<pre class="mwg-prog-cs diff">
+@ SftpFsBasic.cs/166/SftpFsBasic.CreateFileInfo @@ 2012/07/29 00:04:19
+      info.Permission=attrs.getPermissions();
+      info.LastWriteTime=Unix.UnixTime.UnixTimeToDateTime(attrs.getMTime());
+      info.LastAccessTime=Unix.UnixTime.UnixTimeToDateTime(attrs.getATime());
+      info.CreationTime=info.LastWriteTime;
+      info.Length=attrs.getSize();
+
+-     session.Message.Write(1,"i dbg: {0} {1}",attrs.getPermissionsString(),rpath);
+-     try{
+-       string[] extended_data=attrs.getExtended();
+-       if(extended_data!=null)
+-         foreach(string ext in extended_data)
+-           session.Message.Write(1,"i dbg: {0}:ext {1}",rpath,ext);
+-     }catch{}
+-
+      return info;
+    }
+</pre>
+
+<h4>4.4 Cygwin link の実装について</h4>
+<p>現在は生成した cygwin link の内容を FileInfo で保持しているが、
+良く考えたら FileInfo は 5 秒で消えて無くなるし、
+ls を実行する毎に新しい物が生成されるので、
+キャッシュの意味を為していない。
+</p>
+<p>それよりは readlink のキャッシュの寿命の方が cygwin symlink の寿命と近い。
+readlink のキャッシュに byte[] cyglink_content を追加して、
+其処に記録する様に書換えた方がよい。
+(但し、extended information に readlink の情報が含まれていた場合、
+readlink のキャッシュ自体が不要という事になるかも知れない。
+その為、取り敢えずは extended information の中身を見てから考え直した方が良い。)
+</p>
+<p>extended information の方を見てみたが、
+何も情報は含まれていないので現状の readlink のキャッシュに追加で
+cygwin の symlink のデータを保持する事にした。
+</p>
+<pre class="mwg-prog-cs diff">
+@ SftpFsBasic.cs/42/SftpFileInfo.GetCyglinkData @@ 2012/07/29 00:15:28
+     public override long Length{
+       get{
+         if(this.FileType==SftpFileType.LinkAsCygwinSymlink)
+           return GetCyglinkData().Length;
+         return base.Length;
+       }
+       set{base.Length=value;}
+     }
+-
+-    string cyglink_content;
+-    byte[] cyglink_data;
+-    public byte[] GetCyglinkData(){
+-      string content=basic.Readlink(this);
+-      if(cyglink_data==null||cyglink_content!=content){
+-        if(content.Length&gt;0&amp;&amp;content[0]=='/'&amp;&amp;content.StartsWith(basic.RootDirectory)){
+-          content=Unix.UnixPath.GetRelativePathTo(content,Unix.UnixPath.GetDirectoryName(this.FullName));
+-        }
+-
+-        byte[] data=new byte[System.Text.Encoding.Unicode.GetByteCount(content)+14];
+-        System.Text.Encoding.ASCII.GetBytes("!&lt;symlink&gt;",0,10,data,0);
+-        data[10]=(byte)'\xFF';
+-        data[11]=(byte)'\xFE';
+-        System.Text.Encoding.Unicode.GetBytes(content,0,content.Length,data,12);
+-        data[data.Length-2]=(byte)'\0';
+-        data[data.Length-1]=(byte)'\0';
+-        cyglink_data=data;
+-        cyglink_content=content;
+-      }
+-
+-      return cyglink_data;
+-    }
+   }
+
+   class SftpFsBasic:IFsBasic{
+@ SftpBasic.cs/LinkGetEntry/SftpFsBasic.Readlink @@ 2012/07/29 00:19:09
+-    internal string Readlink(FileInfo link){
++    private readlink_cache_entry LinkGetEntry(FileInfo link){
+       string rpath=link.FullName;
+
+       readlink_cache_entry entry;
+       if(readlink_cache.TryGetValue(rpath,out entry)){
+         if(link.LastWriteTime&lt;=entry.informationTime)
+-          return entry.targetPath;
++          return entry;
+       }else{
+         entry=new readlink_cache_entry();
+         entry.informationTime=System.DateTime.MinValue;
+         readlink_cache[rpath]=entry;
+       }
+
+       session.Message.Write(1,"$ readlink {0}",rpath);
+       entry.targetPath=session.Sftp.readlink(rpath);
+       entry.informationTime=System.DateTime.Now;
+       entry.cyglink_data=null;
+-       
+-      return entry.targetPath;
++      return entry;
+     }
++    internal string Readlink(FileInfo link){
++      return LinkGetEntry(link).targetPath;
++    }
++    internal byte[] LinkGetCyglinkData(FileInfo link){
++      readlink_cache_entry entry=LinkGetEntry(link);
++
++      if(entry.cyglink_data==null){
++        string content=entry.targetPath;
++        if(content.Length&gt;0&amp;&amp;content[0]=='/'&amp;&amp;content.StartsWith(basic.RootDirectory)){
++          content=Unix.UnixPath.GetRelativePathTo(content,Unix.UnixPath.GetDirectoryName(this.FullName));
++        }
++
++        byte[] data=new byte[System.Text.Encoding.Unicode.GetByteCount(content)+14];
++        System.Text.Encoding.ASCII.GetBytes("!&lt;symlink&gt;",0,10,data,0);
++        data[10]=(byte)'\xFF';
++        data[11]=(byte)'\xFE';
++        System.Text.Encoding.Unicode.GetBytes(content,0,content.Length,data,12);
++        data[data.Length-2]=(byte)'\0';
++        data[data.Length-1]=(byte)'\0';
++        entry.cyglink_data=data;
++      }
++
++      return entry.cyglink_data;
+</pre>
+<!--************************************************************************-->
+<h3>5. バグ: 特定のファイルの読み取りに失敗 [完 2012/07/30 07:15:33]</h3>
+<p>特定の pdf ファイルを開こうとするとデータが壊れていますと表示される。
+scp でコピーしてきた物と比べると確かに末端の方が 0 で埋め尽くされた状態で取得されている。
+所で今迄の所この現象は pdf でしか起こっていない。偶々かも知れないし、pdf にアクセスする時の
+データを触る順番などが特徴的で丁度現在のキャッシュ機構の穴を突く形になっているのかも知れない。
+</p>
+<p>取り敢えず、コードを整理する前のキャッシュ機構でも同様に問題が生じるかどうかについて確認する。
+→コードを整理する前はちゃんと読み取れている。何処かで何かが間違ったのだろう。
+</p>
+<p>今度はキャッシュを無効にして試してみた。正しく読み取れる。
+なので、悪いのはキャッシュの部分であって SftpFsBasic ではない。
+原因はキャッシュの部分であろう。
+</p>
+<p>再度キャッシュを無効にして試してみたが、やはりエラーになる。
+偶々読み取れなかったという訳では無さそうである。
+</p>
+<p>00 で埋め尽くされていたのはファイルの末端の部分であったので、
+読み取り範囲の末端をキャッシュから取り出す部分が怪しそうである。
+試しに、DetectSequentialAccess と ReadTailFromCache を無効にして
+試してみた所、正しくファイルが読み込まれている様子である。
+</p>
+<p>更に、ReadTailFromCache だけを無効にした状態でも動作するかどうか確認する。
+→やはり正常に動作する。末端からのブロックの切り出しが怪しい。
+しかし、先程確認した時には、切り出し部分は以前のコードから少しも変わっていなかったはず、
+と思ったら ReadBlock にするべき所が、WriteBlock になっていた。
+何か昔も似た様な間違いを起こした事がある…その時は、本当にデータを書き込んでいた為に
+幾つかのごみファイルの内容が消えて無くなってしまった。
+Read と Write のシグニチャが同じなのはやはり危険なのかも知れない…。
+</p>
+<p>兎に角 read と write を間違えていただけだったので、ここを直して一件落着。
+現在の所問題は起こっていない。</p>
+<!--************************************************************************-->
+<h3>6. バグ: その他細かいバグ</h3>
+<p>細かいバグ</p>
+<ul>
+<li>FsBasicReturnException が例外として処理される [完]
+  FsBasicReturnExpcetion は ProcessException で戻り値に変換される予定だったのが、
+  それに対する処理を書き忘れていた為に本当に例外として扱われて
+  戻り値に関わらず再接続を試行する様になっていた。
+</li>
+<li>MainFs サブファイルシステム選択 [完]
+  MainFs でサブファイルシステムを選択する時に
+  filename を破壊的に操作している所為で、
+  正しくファイルシステムが選択されないバグ
+</li>
+<li>ReadData/WriteData で例外を補足していない事 [完]
+  改めてよく見てみたら ReadData/WriteData で例外を補足していなかった。
+  長いファイルをコピーしようとしたりすると必ず失敗するのは之が原因だった。
+</li>
+</ul>
+<!--************************************************************************-->
+<h3>7. 実装: 仮想変更機能 [1.0.2.486-1.0.2.568]</h3>
+<p>取り敢えず、本体を書き換えずに書き換えられた様に見せかける仕組みを作成する。
+「マスター」を変更せずにローカルで表示させる物だけ変更を行う、という物である。
+この機能だけでも有用かも知れない。
+</p>
+<p>先ず、変更を記録する仕組みを考える。
+変更は途中でプログラムが落ちても大丈夫な様に、
+ディスクにキャッシュファイルとして全て書き込んだ方が良い。
+特に一つの変更操作に対して一つのファイルを生成する。
+そして実際にリモートに反映してからファイルを削除する。
+</p>
+<p>もし起動時にファイルが残っていたらそれは未だリモートに反映されていないか、
+リモートに反映している途中にプログラムが落ちたか、
+リモートに反映したがキャッシュファイルを削除する直前にプログラムが落ちたか、
+の何れかである。この場合には再度リモートに変更を適用すればよい。
+ファイル内容の書込であれば二回実行しても問題はない。
+ファイル属性の変更なども同様である。
+ディレクトリの作成・削除等であれば既に作成されていたり削除されていたりすれば、
+例外が発生するがそれは単に無視して良い。
+或いは、ディレクトリが存在しているかどうかを確認してから再度実行をするかどうかを決定すれば良い。
+ファイルの移動などについても同様である。
+</p>
+<p>そして記録した変更の集合を用いてどの様に Reqeust を変化させるかを考える。
+ファイル内容または属性の変更については、実行結果を細工すれば問題ない。
+問題はファイルやディレクトリの移動である。
+ファイルやディレクトリが src から dst に移動された場合、
+dst に対する要求は全て src に redirect しなければならない。
+これは resolvepath の段階で勝手に変更すればよいだけか?
+更に変更履歴を持っていれば redirect は完全に解決できるか?
+</p>
+<ul>
+<li>初期の状態 (マスターの状態) と変更履歴を完全に知っていれば、
+  現在の状態 (仮想的な状態) も一意に決定できているはずなので
+  redirect は解決可能である。
+  但し、マスターの状態を一々取得する必要があるかも知れない。
+</li>
+<li>→許されている操作はファイルの移動とディレクトリの移動である。
+  複数回の操作が実行された場合には、一回ずつの操作に対して順番に redirect を
+  実行していけば最終的に正しい redirect 先が得られる。
+  従って、単一の操作について redirect が解決可能である事を示せれば、
+  数学的帰納法で任意回数の操作について redirect が解決可能である事を示せる。
+  <ul>
+  <li>ファイルの移動に対しては、
+    mv path1 path2 が実行された場合、
+    path2 に対する要求は path1 に対する要求に読み替えれば良い。
+    マスターの path2 に対する読み取り操作は実行できない事になるが、
+    ファイルが上書きされてなくなった後に読み取り操作を実行できないのは自然である。
+    所で、path1 がそもそも存在していなかったなどの理由で mv path1 path2 が失敗する場合には、
+    path2 に対する要求はそのまま path2 に対する要求として素通りさせれば良い。
+    (しかし、失敗するか成功するかの判定はマスターの状態を知らないと分からない)
+  </li>
+  <li>ディレクトリの移動に対しては、
+    mv path1 path2 が実行された場合、
+    path2\* に対する要求は全て path1\* に変更される。
+    何度も色々な階層でディレクトリを移動した時に、
+    この方法でうまくいくのかは非自明な気もするかも知れないが、
+    数学的帰納法的に考えればこれで問題ない。
+    この操作が失敗すると予想される場合には、要求を素通りさせる。
+  </li>
+  <li>mkdir path2
+    に対しては、それより前にはディレクトリが存在していなかったという事なので、
+    例えば path2 に対するアクセスへの変更は全てその場で生成しなければならない。
+    (redirect して得られた結果に対して細工を実行するのではなく自身でファイル情報・内容を生成する。
+    →それもそれまでの変更履歴の情報だけを用いて
+    デフォルトのディレクトリ・ファイル状態に対応するオブジェクトを渡せば良いだけではないか。)
+    ファイルの新規作成の場合も同様である。
+  </li>
+  </ul>
+</li>
+</ul>
+<p>なんとか可能そうな気がするので試しに実装してみる事にする。
+取り敢えずディレクトリ内容の変更に対しては実装完了。[1.0.2.486-1.0.2.564]
+ReadData で WriteData 操作を反映するのも実装完了。[-1.0.2.568]
+デバグは未だ十分やったとは言えない。
+</p>
+<!--************************************************************************-->
+<h3>8. 修正: 細々とした修正・改良</h3>
+<h4>8.1 CachedFsBasic での FileInfo のキャッシュ [完]</h4>
+<p>GetFileInfo/GetFileList が頻繁に呼び出されるが、
+毎回再構築を実行している為にアクセスがとても遅くなっている。
+CachedFsBasic でも FileInfoCache を利用するべきである。
+→実装した。この為に FileInfo の InternalPath を厳密にしなければならなくなったが、
+まあ、他の所でもバグが出て来るかも知れなかったので、これでよい。
+</p>
+<h4>8.2 GetFileInfo のインターフェイスを変更する? [却下]</h4>
+<p>int で戻り値を返し、それが 0 だったら情報の取得に成功した事を表す。
+→色々とコードを見て回ったが、
+</p>
+<ul>
+<li>GetFileInfo はファイルが存在するかどうかを確認するのにも使われる。
+  更に存在した時に何が処理をする事が多い。
+</li>
+<li>それ以外のエラーが発生した時はそれを一々捕捉する事はない。</li>
+<li>頻繁に呼び出される。</li>
+</ul>
+<p class="resume">といった感じの使われ方をしているのでインターフェイスは、
+例外を使用して戻り値を返す今のままの方が良い気がする。
+と言う訳で結局変更はしない。
+</p>
+<h4>8.3 zip を解凍するとできたファイルのサイズが 0 になっている。 [完]</h4>
+<p>これは、WriteData でファイルサイズを更新していないからだろうか…。
+→WriteData でファイルサイズを更新する様にしたら、
+ちゃんと有限のサイズで表示される様になった。
+</p>
+<h4>8.4 ReadData キャッシュの位置 [完]</h4>
+<p>ReadData のキャッシュを PathRedirect 後の場所で行っている所為で、
+大変な数の ReadData に対して PathRedirect が実行されて遅くなっている。
+</p>
+<p>ReadData のキャッシュは PathRedirect 前に置いた方が良いのではないか?
+変更操作をする度に ReadData のキャッシュが無効になる。
+PathRedirect 後にキャッシュをしておくと変更操作を実行する度にキャッシュが無効になるが、
+変更操作の追加に対してはキャッシュは何も影響を受けない。
+PathRedirect 前にキャッシュをしておくと変更操作を追加する度にキャッシュが無効になるが、
+変更操作の実施に対してはキャッシュは影響を受けない。
+変更操作の実施は長期間にわたるが、
+変更操作の登録は或る程度実行したら一定期間行われないのが普通である。
+という事は、現在の実装に反して ReadData のキャッシュは PathRedirect 前に置いた方が良い。
+</p>
+<p>取り合えず実装してみたがそれ程効果が見えている訳ではない。
+</p>
+<h4>8.5 ファイルをコピーした直後に中を覗けないバグ [完]</h4>
+<p>WriteData のキャッシュが GetFileList の方に反映されていないからかと思ったが、
+其処を修正しても何も変わらなかった。
+</p>
+<p>コピーした直後に中をのぞけないのではなく ls した直後に中を覗けない様子である。
+一回触って、一二秒待ってから開く様にすると問題ない。
+つまり、直接の GetFileInfo だとエラーになるが、
+キャッシュされた GetFileInfo を用いるとエラーにならないという事だろうか。
+</p>
+<p>→ReadData の戻り値を暫定的に basic.ReadData の戻り値にしていたのが原因だった。
+ちゃんと読み取れているのに非零の値が返されて、それが理由で中が覗けなかった。
+一旦キャッシュされれば、basic.ReadData を呼び出さずに中を表示できた…と言う事か?
+とにかく常に 0 を返す様に修正したら問題は起こらなくなった。
+</p>
+<h4>8.6 「ファイルが見付からなかった」という事もキャッシュするべき? [完]</h4>
+<p>zip ファイルの解凍を実行すると存在していないディレクトリに対して、
+物凄い勢いで ls を実行している。
+しかし、存在していないディレクトリなのでキャッシュされていない。
+</p>
+<p>本当だったら存在していないという事が分かった時点で再度アクセスされる事はないのだが、
+今回の場合はそれより後の操作によって存在が保証されているから、
+何度もアクセスされてしまうのである。
+→でも、存在が保証されているのであれば、ちゃんとキャッシュされている筈である…。
+</p>
+<p>では何故何度も何度も ls が実行されるのだろうか…。
+→どうもファイルに書き込む時に、既にファイルが存在しているかどうかを確認する為に、
+一々 ls が実行される様子である。更に、存在の確認は List 単位ではなく、
+ファイル単位で実行される為に、CachedFsBasic で "リストが存在していない" という事を
+キャッシュしても意味がない。
+</p>
+<p>→CashedFsBasic でも SftpFsBasic でも、
+"ディレクトリが存在していない" という事をキャッシュする様にしたら、
+zip ファイルの解凍は素晴らしく速くなった。
+</p>
+<h4>8.7 ReadData で実際にダウンロードする範囲を最低限に抑える。[完]</h4>
+<p>やたら大量に ReadData を実行する物だからパフォーマンスが落ちている様に思う。
+取り敢えず実装した。余りこれを用いる状況が再現しない気がするので、
+正しく動作しているかどうかは謎。
+</p>
+<h4>8.8 WriteFile offset=-1 の問題 [完]</h4>
+<p>cygwin 上から >> で書込を実行すると、offset = -1 で WriteFile が呼び出される。
+これは常に「追記」という解釈で正しいのだろうか。
+(/dev/null 等の様に書込位置という概念が存在しないファイルも存在する。
+それらを扱う為には確かに -1 という offset を指定するしかないが…。)
+</p>
+<p>Dokan の document を参照する必要がある。
+→見てみたが何も書かれていない…。酷い。。
+一番詳しいのは見た感じ dokan/readme.ja.txt であるが、
+Windows API に似せて作ってあります、としか書いていない。
+</p>
+<p>一方で WinAPI WriteFile は offset など受け取らない。
+事前に seek をしてその位置に移動してから書込を実行するから。
+</p>
+<p>実はこれは Dokan の仕様とかではなくて元々のファイル操作の問題か?
+fopen("file","ab") で開いてみた所 seek 操作は無視された。
+"a" で開くと完全に追記モードで seek も何もできないという事か。
+その場合には常に offset=-1 で書込位置が指定されると解釈して良いのか?
+</p>
+<p>実際に "a" で開いて書込を実行するプログラムを、
+仮想ディレクトリの上で実行してみた所、ちゃんと offset が設定されて実行される様である。
+seek をしても offset はファイル末端を指したままと言うことのようである。
+と思ったら cygwin でコンパイルした時に限って offset=-1 となる様である。
+しかも、コンパイラによって bash から起動できたりできなかったりする。
+</p>
+<table class="normal center">
+<tr><th>Compiler</th><th>offset</th><th>bashから起動</th><th>explorerから起動</th></tr>
+<tr><td>MinGW</td><td>正の値</td><td>SIGSEGV</td><td>可能</td></tr>
+<tr><td>VC</td><td>正の値</td><td>SIGSEGV</td><td>可能</td></tr>
+<tr><td>Cygwin</td><td>-1</td><td>可能</td><td>可能</td></tr>
+</table>
+<p>何故 SIGSEGV になるのか分からないと思っていたが、
+これは再マウントした時にパスが無効になっていたからだと思われる。
+今回の事には関係ない。下の項目を参照。
+</p>
+<p>よく分からないが取り敢えず -1 が渡されたら末端にデータを追加する事にする。
+</p>
+<h4>8.9 <del>cygwin bash から非 cygwin プログラムを起動できない</del> [完]</h4>
+<h5>症状?</h5>
+<p>カレントディレクトリが仮想ディレクトリの時、
+Cygwin Bash から非 cygwin プログラムを起動できない。
+起動しようとすると Segmentation Fault と表示されて失敗する。
+或いは、g++.exe (MinGW) cl.exe (MinGW) の場合には
+ファイルが開けませんでしたと表示される。
+</p>
+<p>起動できないと思っていたが、
+これはファイルを開くのに失敗して FILE* f が NULL になっているからだった。
+起動まではちゃんとできている。問題はファイルを開く時。
+</p>
+<p>うーん。カレントディレクトリが正しく設定されていないという事だろうか。
+と思って getcwd して見たが正しく設定されている。
+というか、そもそも Q:\ 以外のドライブでも正しく開けるのだろうか。
+(少なくとも C:\ の上では開けるが。)
+→と思って F:\ で実行してみたらちゃんとファイルを開けている様子である。
+やはりこれは Cygwin と Dokan の相性の問題なのだろうか。
+</p>
+<p>と思ったら急に起動できる様になった…。
+一旦別のドライブに移ってから戻ってくると良いのだろうか。。
+再現方法をまとめると以下の様になる。
+</p>
+<ol>
+<li>マウントする</li>
+<li>cygwin bash を起動する</li>
+<li>アンマウントしてマウントする</li>
+<li>cygwin bash から X (非 cygwin プログラム) を起動する</li>
+<li>X の中ではファイルを開けない (CreateFile に失敗?)</li>
+<li>一回 cd を実行すると回復する。例えば cd $PWD</li>
+</ol>
+<p>何かよく分からないが…
+cygwin の中ではカレントディレクトリの内部表現を保持していて、
+マウントし直すとカレントディレクトリの内部表現が変化するという事だろうか。
+そして cd すると、カレントディレクトリの内部表現が再計算されて再度動く様になるという事か。
+(しかし、絶対パスでファイルを開こうとしてもファイルを開けないのは不思議である。)
+</p>
+<h5>結論</h5>
+<p>再マウント Cygwin Bash からフォークした非Cygwinプログラムでファイルを開けない。
+対処としては、再マウント後に cd $PWD を一回実行すれば元通りになる。
+</p>
+<h4>8.10 バグ: 新規ディレクトリを作成すると頻繁に PathTrace が起きて遅い [完]</h4>
+<p>FileInfo キャッシュについても「ファイルが存在しない」という事をキャッシュした方が良いか。
+やはり新規ディレクトリなどを作成すると、
+存在しないファイルに対して何度も (凄まじい回数) アクセスを試み、
+それに対してキャッシュが働かずに何度も PathRedirect を実行していて効率が悪い。
+</p>
+<p>なので、GetFileInfo についても GetFileList と同様に
+ファイルが存在しないという情報をキャッシュした方が良い。
+しかし、List と異なるのは情報の日付を FileInfo オブジェクト自体が保持しているという点である。
+この為に、単に null を登録すればよいという訳でなくなるのが厄介である。
+</p>
+<p>ファイルが存在しないという事を表す特別な FileInfo インスタンスを作成するのが良いだろうか。
+→これは name を null とする事で表現する事にした。
+しかしファイルが存在しないという情報もキャッシュする様に変更したのだが、
+それでも何度も何度も存在しないファイルに対するアクセスがある。
+</p>
+<p>と思ったら、キャッシュがうまく働いていない様子だった。
+(しかも CacheChange によって生成されて存在しているとされているファイルに対して。)
+ファイルが存在しているという事になっているのにキャッシュされていないのは、
+FileInfo の InternalPath が実際のパスと異なる物になっているというバグの為であった。
+</p>
+<p>そして、それは WCacheGetFileInfo/List 関数内で、
+渡された引数 rpath が PathTrace 関数によって変成を受けていた為であった。
+変成を受けた rpath は tpath として区別する様にした。
+</p>
+<h4>8.11 削除・上書きしてなくなるファイルに対する操作は消す。[完]</h4>
+<p>例えば dlist の中身が</p>
+<pre>
+write "A" hello
+setfilesize "A" 3
+mv "B" "A" # ←上書き
+</pre>
+<p class="resume">となっていたら dlist は以下の様に簡単化できる。</p>
+<pre>
+mv "B" "A"
+</pre>
+<p>これは例えば、間違えて大容量のファイルをコピーしてしまった時などに、
+操作を取り消してアップロードを止めるのに必要である。
+</p>
+<p>実装してみたが、取り敢えず動いている様子である。</p>
+<h4>8.12 WriteData の度に truncate が実行されている [完]</h4>
+<p>SFTP ではファイルに書き込むだけでは書込日時が更新されないので手で日時を更新する様にしている。
+そして毎回 set stat が実行されているのは毎回書込日時を更新しているからだと考えていた。
+然し、今度 set stat の中で何をやっているのかを調べてみた所、毎回実行されているのは touch の方であった。
+</p>
+<p>何故かと思っていたらバグを幾つか発見。
+先ず、SetFileInfoFlags の値の定義がビットになっていなかった。
+なので、或る情報を設定しようとすると別の情報も設定されてしまうという変な事になっていた。
+次に、SefFileInfoFlags でビットが立っているかどうかを確認する時に & ではなく | を使っていた。
+これでは毎回必ず全ての情報を書き込む事になってしまっている。
+</p>
+<p>また、ファイルに書き込んだ時にファイルサイズの更新も行っていたのは、
+直後に GetFileInfo した時に、変な値が返らないようにするためであった。
+つまり、直前にやった操作に反しない程度に FileInfo を更新しているのである。
+結局、GetFileInfo した時に問題が生じなければよいので、
+ファイルサイズ情報の更新だけでは別にリモートに適用しなくても良い。
+</p>
+<p>→と思ってそうなる様にしたら、今度は書き込んだファイルの内容が 0 で
+埋め尽くされる様になってしまった。
+これは、古い attr の値 (ファイルの長さが今より短かった頃の値) を使って、
+ファイルの長さも書込時刻と一緒にリモートに書き込まれていたからであった。
+</p>
+<p>なので、正しくリモートに反映する為には</p>
+<ul>
+<li>本当に最新の情報を元にして set stat をする
+  →でもこれは時間が掛かってしまう。何とか避けたい。</li>
+<li>GetFileInfo で返される情報と矛盾しない様に更新
+  →考えてみれば、これが一番最新 (attr よりも最新) の矛盾無い情報なので、
+  これを元にして set stat を実行する方が賢明である。
+</li>
+</ul>
+<p>という訳で b の方針で set stat を実行する様に書き換えた。
+因みに、GetFileInfo で返される内容を最新に保持しておく必要がある。</p>
+<p>CreateFile でも同様の事が起こる危険性がある。
+ファイルの内容を消したつもりなのに、古い情報で set stat した時に
+ファイルの長さが昔の物に戻ってしまう。
+→と思ったが、CreateFile では本当に fi.Length=0 を
+SetFileInfo しているので問題にはならない。
+</p>
+<h4>8.13 ロックの仕方 [完 673-690]</h4>
+<p>現在のロックの仕方だと或るスレッドで読み取りを実行している時に、
+別のスレッドから読み取りをする事ができない。
+然し、元々ロックをしている目的は同時に読み込むのは OK だが、
+読み込んでいる間に書込・変更操作があっては行けないという物であった。
+</p>
+<p>こう言った物を管理する為のクラスなどは用意されているのだろうか。
+或いは、lock を利用してそういう機構を作成しなければならないのだろうか。
+→然し、どうやってそれを実現するのか…。
+</p>
+<ol style="list-style-type:lower-alpha;">
+<li>書込操作の前には読込中フラグが倒れている事を確認し、
+  書込中フラグを立てて書込操作が終わったら書込中フラグを倒す。
+  書込操作は完全に同期でなければならない。
+  つまり、書込操作自体も並列で行う事はできない。
+  読込操作の時にはフラグを見て立っていなければ、
+  読込中カウントを増やして読込が終わったら読込中カウントを倒す。
+</li>
+<li>Semaphore: 
+  <p>見た感じ、これの初期化で int.MaxValue でも渡しておいて、
+  書込をする時に、int.MaxValue を要求すれば良い気がする。
+  と思ったが… int.MaxValue だけ要求するには WaitOne を
+  int.MaxValue 回だけ呼び出さなければならないらしい…。
+  これは使えない。</p>
+</li>
+<li>ReaderWriterLock: 
+  <p>と思っていたら、丁度目的にあった物が存在する事が分かった。
+  もっと複雑な事をしたい場合でも、これを使えば簡単に実装できそう?</p>
+</li>
+</ol>
+<p>ん? 然し、現在の設計だと読込操作自体、
+cnstructionStartIndex だとか targetPath の所為で同期して実行する必要がある気がする。
+まあ、これについては constructionStartIndex/targetPath を記録する為の
+別のインスタンスを用意すればどうとでもなるから気にしなくても良いが。
+</p>
+<p>変更方法としては、</p>
+<ol>
+<li>constructionStartIndex/targetpath を他のインスタンスに分離する。</li>
+<li>ReaderLock を取得する関数と解放する関数、
+  WriterLock を取得する関数と解放する関数を dlist に用意する。
+</li>
+<li>各 lock の呼び出し箇所を、RW 指定のロックに変更する。
+  Dipose で解法処理をラップして using を使ってくるむと書きやすいだろう。
+</li>
+</ol>
+<p>書換を行ったら動かなくなった。
+全てを WriterLock で取得する様にしてみてもやはり問題が残っているので、
+ReaderWriterLock の使い方を根本的に誤っているか、
+或いは 1 の constructionStartIndex/targetpath の分離を誤っているかのどちらかである。
+と思ったら、CTRUCT_NOT_FOUND と CTRUCT_CREATED の値が両方とも -2 になっていた…。
+両者をそれぞれ異なる物に変えて見たら取り敢えず動作する様になった。
+</p>
+<p>今度は i.bmp の中身が読み取れなくなった。
+ファイルの先頭の方しか読み取られていない様である。
+どうやら一番初めに 0-1000 だけ読み取って、その時には正しく tkynt2 迄データを取りに行くが、
+それ以降は tkynt2 にデータを取りに行っていない様である。
+やはり初回の要求に対してだけデータを取りに行っている様子である。
+と、思ったら、これも以前に作ったバグであった。
+Range に初期の範囲を指定する時に、末端位置を指定するべき所に領域の長さを指定していた。
+0 から始まる範囲を読み取る時には問題はなかったが、
+途中 (offset) から場合には実質的に領域の長さを -offset して読み取っていた事になる。
+</p>
+<!--************************************************************************-->
+<h3>9. 実装: 書込機能 [1.0.2.660-1.0.2.673]</h3>
+<p>取り敢えず、復元機能など他の機能よりもこちらの更新機能の方が欲しいので、
+こちらを先に実装する事を考えたい。
+</p>
+<p>必要なのは、新しいスレッドを立ち上げる事。
+dlist に中身が残っている場合には更新を実行する事。
+</p>
+<p>[660-673]
+後、段々と CachedFsBasic が肥大化してきたので、
+機能で分離できる部分を dlist に押しつけて整理する事にする。
+試しに変更後も動作するかどうか確認しようとしたら、新しく作成されたファイルが表示されなくなっていた。
+何か変な事でもしたかと思って動作を見てみたら PathTrace の実装で、
+WriteData や CreateFile, SetFileInfo で親ディレクトリの一覧表示の時に、
+変更が起こるという事を通知するのを忘れていた。
+(今迄問題がない様に思われたのは何だったのか…
+最近の別の変更によってこれが問題になる様になったと言う事だろう。
+最近 PathTrace の設計を思い切って変更したので。)
+</p>
+<p>若し可能であれば、データの更新・書込機能自体も dlist に押しつけると良いかも知れない。
+→しかし、その為には basic インスタンスを dlist に渡す必要がある。
+dlist が其処まで関知するのはやりすぎなので、
+やはり書込更新機能は CachedFsBasic の方でやる方が良い気がする。
+</p>
+<p>[690-702]
+更新を実装するに当たって、
+その瞬間その瞬間で現在の状態を確認して、
+矛盾が生じていたらその操作を変更するという処置が必要かも知れない。
+</p>
+<ul>
+<li>例えば、RemoveFile について。
+  ファイルを書き込んで散々色々な事をした後にファイルを削除したとする。
+  この場合、RemoveFile 命令だけはそこに残しておく事にしてあるが、
+  これは元々存在しないファイルに対して RemoveFile を実行する事にもなる。
+  なので、一応 RemoveFile の前にファイルの存在を確認して、
+  もしファイルが存在していなかったら rm を要求するのを中止する。
+  また、RemoveFile の OperationTime よりも後に作られたらしいファイルが
+  其処に出現している場合にも、rm を要求するのは止めておいた方が良い。
+</li>
+<li>或いは、MoveFile について。
+  operationTime よりも後に destination に何か出現していたら、
+  上書きする代わりに、バックアップとして別の名前に変えておくべき?
+  例えば mv A B としたのに、その後に B に何かファイルが出現したら、
+  先ず mv B B~ をして、その後で mv A B を実行する。
+  この処置についてはユーザに通知を行った方が良いかも知れない。
+</li>
+</ul>
+<p>取り敢えず矛盾が生じていたらバックアップを作成して、
+できるだけ操作を遂行するという方針で、各操作に対する実行コードを書いた。
+</p>
+<p>取り敢えず UpdaterWorker 関数を書いてスレッドを起動する様にしたら、
+すんなりと動くようになったようである。
+書き込まれた情報などを見ても矛盾などは生じていない様に見える。
+但し、大量の書込を実行すると書込と更新が交互に実行されて全然キャッシュの意味を為していない。
+動作としては書込は更新のタイミングに関わらず自由にできて欲しいのだが…。
+更新が時間をかけた読込を要求する為に、書込に時間が掛かってしまっている様子である。
+んー。というか GetFirst で ChangeCache を取得できたら、読込ロックを保持している必要はない?
+</p>
+<p>唯一 WriteData だけは DoUpdate している最中に Clear されると困るので、
+これは CacheChange_WriteData 内部で独自に lock を実行して保護する事にした。
+(この lock が被る事は滅多にないだろう。アップロード中のファイルを削除する時だけのはず。。)
+→これで実行したらとても動作が速い。ちゃんと動いている。安心。
+</p>
+
+<!--########################################################
+
+          A03
+
+#########################################################-->
+<h2>A03. ファイル名の特別文字</h2>
+<h3>1. ファイル名の特別文字 [完]</h3>
+<p>現在ファイル名に特別な文字が含まれている場合に、ファイル名を変更して表示している。
+この変更の仕方を Cygwin と同じ様にしたら良いのではないか?
+Explorer 上では変な文字 (点) で表示されるが、cygwin の上からは元々のファイル名で見る事ができる。■
+</p>
+<p>どうやら cygwin では特別な文字に対しては私用領域の文字を割り当てている様である。
+では、私用領域の文字に対しては…何を割り当てているのだろう…。
+→試してみた所、私用領域の文字は特別な文字として認識される様である。
+</p>
+<p>つまり、</p>
+<ul>
+<li>':'      in cygwin → '\uF03A' in win</li>
+<li>'\uF03A' in cygwin → '\uF03A' in win</li>
+<li>'\uF03A' in cygwin → ':' in cygwin</li>
+</ul>
+<p>後特別文字には何が含まれているのかについて。。</p>
+<ul>
+<li>私用領域に翻訳される物:
+  <p>[:"<>|?*], \x01-\x07, \x0A-\x1F</p>
+</li>
+<li>無視される物:
+  <p>\0 (以降を全て無視される。文字列終端と勘違いするんだろう)</p>
+</li>
+<li>怒られる物:
+  <p>\8 (BS), \9 (HT)
+  </p>
+</li>
+</ul>
+<p>実装した。<>:" 等の文字が入っているファイル名も扱える様になった。
+しかし、* や ? が入っているファイル名は扱えない様子。
+SFTP がワイルドカードと勘違いしている様な気がする。これは諦める。
+</p>
+
+<h3>3. '.' で終わるファイル名について [完 2012/07/29 23:26:52]</h3>
+<p>". で終わるファイルに触れない" という問題。
+これは Dokan のバグか Windows の仕様と思われる。
+DokanOperations にデータが渡される時点で、既に末端の . が削除されている。
+どうも色々見てみた結果、Windows の仕様ではないかと思われる。
+</p>
+<p>→ . で終わるようなファイルは GetFileList する時に勝手に改名してしまえば良い。例:</p>
+<ul>
+<li>"a." → "a.@"</li>
+<li>"a. " → "a. @"</li>
+<li>"a@" → "a.@@"</li>
+</ul>
+<p>然し改めて試してみた所、cygwin からは
+. で終わるファイル名のファイルを作成する事ができるし、
+それをエクスプローラで見ても正しく表示されている。どういう事か?
+ファイルシステムに依存するという事なのかも知れない。
+其処で、試しに FAT32 (USB) で . で終わるファイル名のファイルを作成してみたが、
+普通に作成する事ができた。操作についても問題はない。
+</p>
+<p>再度、マウントしたファイルシステムで a. というファイルを作ってみた。
+問題なく作成できている。読み取りも問題ない。書込も問題ない。
+では以前に問題になったのはどういう事だったのか。
+</p>
+<p>改めて、cat などではなく notepad で開いてみる事にしたら
+リモートの . で終わるファイルを開けなかった。
+更に、ローカルで b. という名前のファイルを作成して notepad で開こうとしたが、
+b という名前のファイルを開こうとしている様で、ファイルを開く事ができなかった。
+実は、. で終わるファイルに触れないのは notepad の問題だった様で、
+これは普通の NTFS や FAT32 でも共通に発現するバグだった様である。
+</p>
+<p><u>[これは notepad.exe のバグだった]</u></p>
+<!--########################################################
+
+          A01
+
+#########################################################-->
+<h2>A01. 鍵認証への対応 [完]</h2>
+<p>鍵認証の設定のインターフェイスを作成するのが面倒だったので放置していたが、
+実用上は鍵認証にする事の方が多い様なので、UI を対応させる。
+</p>
+<p>1.0.2.286:
+取り敢えず直接ログインできる設定の場合に対応。動作確認済
+</p>
+<ul>
+<li>鍵ファイルの存在チェックと、存在しない場合の色付け表示</li>
+<li>タブオーダー</li>
+</ul>
+<p>多段 SSH でログインする場合には、UI を工夫しないと行けない。
+今迄は、表形式でログイン先とパスワードを入力させていたが、
+設定が複雑になるので、ListBox で表示して、編集は選択して一つずつ設定する様にする。
+</p>
+<p>→多段の場合にも対応。</p>
+
+<!--########################################################
+
+            問題14
+
+#########################################################-->
+<h2>B14. 20120407 1.0.2.327 [完]</h2>
+<h3>症状</h3>
+<p>ls 等が滅茶苦茶遅い。
+どうやら、一つ一つの全てのファイルについてディレクトリとして開く操作を試している様である。
+そして、それを実行する度に例外が発生する。
+結局、(ファイル数)×3 の Request/Response を実行し、(ファイル数) 回の例外が発生するのを待たなければならなくなっている。
+</p>
+<p>更に、ls 以外でも、cp -p hoge koge/ しようとする時にも、
+一見して無関係のファイルに対して全てディレクトリとして開く操作が試されている?
+→と思ったら、Makefile の日時確認の為に開かれているだけであった。
+</p>
+<h3>解明</h3>
+<p>まず、どの様な FsOperation として、このディレクトリとして開く操作が実行されるかを調べる。
+その為に、全ての FsOperation からログを出力する様にする。
+→というか、調べるまでもなく、例外の情報を見ると全て ReadFile であった。
+</p>
+<p>んー。ls の途中で、プログラムを一時停止させたら rwx 属性情報が ??? になった。
+どうやら、ファイルの種類やアクセス属性を調べる為に、色々な path で試し読みをするらしい。
+しかし、/file.txt/ 等という名前でファイル読み取りが成功する事などがあるのだろうか…?
+</p>
+<p>また、fopen /file.txt/ という物も、ReadFile の前に呼び出されている。
+これは、CreateFile から呼び出されている様である。
+</p>
+<h3>変更</h3>
+<p>ReadFile で、"/" で終わるファイル名の時に、直ぐにエラーを返す様にした。
+</p>
+<p>GetFileType で、今迄は末端の "/" は全て無視していたが、
+"/" で終わる通常ファイルの場合には、NotExist を返す様に変更した。
+→この変更でかなり早くなった様に思う。
+</p>
+<!--########################################################
+
+            問題12
+
+#########################################################-->
+<h2>B12. 何故か、自動切断時間の設定を保存しても反映されない。[完 2012/02/17 06:42:21]</h2>
+<p>と思ったら serialize のコードに欠陥があった。</p>
+<pre class="diff mwg-prog-cs">
+@@ SshGateSession.cs @ 2012/02/17 06:36:55
+     SftpAccountGw(Ser::SerializationInfo info,Ser::StreamingContext context){
+       this.name=info.GetString("name");
+       this.gwchain=(Gen::List&lt;SshUserData&gt;)info.GetValue("gwchain",typeof(Gen::List&lt;SshUserData&gt;));
+
+       SerializationInfoReader reader=new SerializationInfoReader(info);
+       reader.GetValue("offline",out this.offline);
+       reader.GetValue("rootdir",out this.rootdir);
+       reader.GetValue("s_readonly",out this.s_readonly);
+       reader.GetValue("s_reconnect_count",out this.s_reconnect_count);
++      reader.GetValue("s_discon_interval",out this.s_discon_interval);
+       reader.GetValue("s_beat_interval",out this.s_beat_interval);
+       int symlink;
+       if(reader.GetValue("symlink",out symlink))
+           this.symlink=(SftpSymlink)symlink;
+     }
+     void Ser::ISerializable.GetObjectData(Ser::SerializationInfo info,Ser::StreamingContext context){
+       info.AddValue("name",this.name);
+       info.AddValue("gwchain",this.gwchain);
+       info.AddValue("offline",this.offline);
+       info.AddValue("rootdir",this.rootdir);
+       info.AddValue("s_readonly",this.s_readonly);
+       info.AddValue("s_reconnect_count",this.s_reconnect_count);
++      info.AddValue("s_discon_interval",this.s_discon_interval);
+       info.AddValue("s_beat_interval",this.s_beat_interval);
+       info.AddValue("symlink",(int)this.symlink);
+     }
+@@ SshSession.cs @ 2012/02/17 06:42:06
+     //==========================================================================
+     // ISerializable
+     //==========================================================================
+     SftpAccount(Ser::SerializationInfo info,Ser::StreamingContext context){
+       this.name=info.GetString("name");
+       this.data=(SshUserData)info.GetValue("data",typeof(SshUserData));
+
+       SerializationInfoReader reader=new SerializationInfoReader(info);
+       reader.GetValue("offline",out this.offline);
+       reader.GetValue("rootdir",out this.rootdir);
+       reader.GetValue("s_readonly",out this.s_readonly);
+       reader.GetValue("s_reconnect_count",out this.s_reconnect_count);
++      reader.GetValue("s_discon_interval",out this.s_discon_interval);
+       reader.GetValue("s_beat_interval",out this.s_beat_interval);
+       int symlink;
+       if(reader.GetValue("symlink",out symlink))
+           this.symlink=(SftpSymlink)symlink;
+     }
+     void Ser::ISerializable.GetObjectData(Ser::SerializationInfo info,Ser::StreamingContext context){
+       info.AddValue("name",this.name);
+       info.AddValue("data",this.data);
+       info.AddValue("offline",this.offline);
+       info.AddValue("rootdir",this.rootdir);
+       info.AddValue("s_readonly",this.s_readonly);
+       info.AddValue("s_reconnect_count",this.s_reconnect_count);
++      info.AddValue("s_discon_interval",this.s_discon_interval);
+       info.AddValue("s_beat_interval",this.s_beat_interval);
+       info.AddValue("symlink",(int)this.symlink);
+     }
+</pre>
+<!--########################################################
+
+            問題11
+
+#########################################################-->
+<h2>B11. 何故か既に存在するファイル名に一見して変更出来てしまう。 - 2010/06/26</h2>
+<p>結果として、同じファイル名のファイルが二つになってしまう。
+しかし、実際には何が起こっているのだろう…?
+</p>
+<p>→既に存在しているファイルに上書きされているだけだった。
+最新の情報に更新を押すと、ファイルが一つ減るのが確認出来る。</p>
+<p>単に上書きしようとしている時と区別する方法はあるのか?</p>
+<p>→試してみた所</p>
+<ol>
+<li>他のディスクから上書きする時には、
+Windows の側で上書きの確認のウィンドウを出して、
+put で上書きしていた。</li>
+<li>同じディスク内で移動上書きする時には、
+何も確認の window を出さずにいきなり上書きされた。</li>
+</ol>
+<p>→従って、Windows としては同じドライブ内の移動に関しては、
+ドライブの側で上書き確認を出す事を期待しているらしい。
+つまり、上書き確認ウィンドウを出すのを自分で実装しなければならない。</p>
+<p>→と思って自分で表示するようにした上で、戻り値にエラーを返したら別のウィンドウが表示される。
+ERROR_CANCELED だと、指定したファイルは存在しませんと言われて、
+ERROR_ALREADY_EXISTS だと、同じメッセージ (指定したファイルは既に存在しています) と表示された。
+なので、結局、ERROR_ALREADY_EXISTS を返せば良かっただけで、
+自分でメッセージを表示する必要はなかった様である。</p>
+<pre class="diff mwg-prog-cs">
+@ mwg.Sshfs.SftpFsOperation.InternalMoveFile @@ 08:39 2010/06/26
+          if(UnixPath.GetDirectoryName(filename)==UnixPath.GetDirectoryName(newname)){
+-           Forms::MessageBox.Show(
+-             string.Format(
+-               "{0} の名前を変更出来ません。\r\n指定したファイル {1} は既に存在します。別の名前を指定して下さい。",
+-               UnixPath.GetFileName(path),
+-               UnixPath.GetFileName(newpath)
+-             ),
+-             "ファイルまたはフォルダ名のエラー",
+-             Forms::MessageBoxButtons.OK,
+-             Forms::MessageBoxIcon.Error
+-           );
+            return -WinErrorCode.ERROR_ALREADY_EXISTS;
+          }
+</pre>
+<p>→もしかすると、ファイルを移動する際にも上書き確認は自分で表示しなくても良いのかも知れない。
+と思って、単に WinErrorCode.ERROR_ALREADY_EXISTS を返すようにしたら、
+ちゃんとエクスプローラで上書き確認のウィンドウを表示してくれた。
+所が、ちゃんと上書きの処理が実行されないようである。</p>
+<p>→引数をよく見たら MoveFile には引数として replace という物が付いている。
+すっかり見ていなかった。なので、replace が true の時には
+確認せずに上書きするように変更した。
+しかし、それでも動作は変わらない。(元々 replace は常に false という事なのだろう。)</p>
+<pre class="diff mwg-prog-cs">
+@ mwg.Sshfs.SftpFsOperation.InternalMoveFile @@ 
+-       if(this.GetFileType(newpath)!=FileType.NotExist){
++       if(!replace&&this.GetFileType(newpath)!=FileType.NotExist){
+-         if(UnixPath.GetDirectoryName(filename)==UnixPath.GetDirectoryName(newname)){
+-           return -WinErrorCode.ERROR_ALREADY_EXISTS;
+-         }
+-         string message=string.Format(
+-           @"指定したファイルは既に存在しています。
+-以下のファイル
+-{0}
+-を次のファイル
+-{1}
+-に上書きしますか?
+-",filename,newname);
+-         Forms::DialogResult result=Forms::MessageBox.Show("指定したファイルは既に存在しています。","ファイル上書き確認",Forms::MessageBoxButtons.OKCancel);
+-         if(result!=Forms::DialogResult.OK)
+-           return -WinErrorCode.ERROR_CANCELLED;
++         return -WinErrorCode.ERROR_ALREADY_EXISTS;
+        }
+</pre>
+<p>→動作を見ていたら、上書きで移動しようとしても移動出来なかったが、
+移動先の重複していたファイルは勝手に消えている。
+</p>
+<p>ログを見ると一旦 rm を実行してそれから mv しようとしているように見える。
+一旦 rm をしている筈なのにその後の mv (MoveFile) でも既に移動先ファイルが存在している、
+という事になってしまっているらしい。
+</p>
+<p>其処で、stat_cache をクリアする部分を見てみると、…ls の結果しかクリアしていなかったので、
+単体で移動先ファイルを stat (rm した筈の物) すると、
+削除したのにも拘わらず削除前の情報が返されて未だ存在しているかのように見えてしまうという事だった</p>
+<p>→stat_cache にファイル個別の情報を削除する関数 ClearFile を付け加えた。
+そして、stat_cache.ClearLsResult を呼び出している所それぞれに、
+新しい関数 ClearFile の呼出も追加しておいた。
+序でに ClearLsResult の関数名も変更しておいた。</p>
+<!--########################################################
+
+            問題10
+
+#########################################################-->
+<h2>B10. ファイルを送信すると、何度も失敗・再接続を繰り返しながら進む</h2>
+<p>ファイルをコピーしようとすると、沢山失敗して、何度も再接続を試みようとする。
+具体的には IOException で inputstream is closed と表示される。
+何度も例外を発生させながら、何とかコピーが進んでいくという感じで、
+然し、それでも途中で失敗 (二回連続の失敗) する場合が多い。
+</p>
+<p>[原因] <del>これは、一度に大量に put しようとするとなるのか??</del>
+試した結果、一度に大量に stream に Write しようとするのが良くないようである。
+</p>
+<p>[解決] put する時の stream に、一気に Write するのではなく、
+0x1000 ずつ Write する様にした所、
+途中でエラーが起こることなく書き込みする事が出来るようになった。
+</p>
+<!--########################################################
+
+            問題9
+
+#########################################################-->
+<h2>B09. キャッシュの即時性の確保 - 2010/06/21</h2>
+<p>ファイル日時を見て更新するようにしてみた。
+が、更新されていない。
+どうも、Sftp で部分的に put しても、ファイル日時は変更されないようである。
+なので、WriteData する時に同時に SetFileTime もするようにする。
+</p>
+<p>WriteData する時に SetFileTime もする様にしてみたが、
+どうやら Cache の実装が SftpFsOperation に依存するようになってしまったようである。
+キャッシュに必要な Operations の追加インターフェースを定義して、もう一回書き直す事にする。
+</p>
+<h3>修正</h3>
+<pre class="diff mwg-prog-cs">
+@@ mwg.Sshfs.SftpNoCache @ 00:27 2010/06/21
+-   protected SftpFsOperation operation;
++   protected IRemoteFsOperation operation;
+    protected ISshSession sess;
+
+-   public SftpNoCache(SftpFsOperation operation){
++   public SftpNoCache(IRemoteFsOperation operation){
+@@ mwg.Sshfs.SftpEasyCache.ReadData @ 00:32 2010/06/21
+-     /*
+-     jsch::SftpATTRS attr=operation.stat(name);
+-     operation.ResolveLink(name,ref attr,10);
+-     // 既に stat 内で resolve されている。
+-     // resolve されていない時は、link 内を直接読み取る。
+-     int date=attr.getMTime();
+-     //*/
+-     int mtime=operation.stat(name).getMTime();
++     System.DateTime mtime=operation.GetMTime(name);
+@@ mwg.Sshfs.SftpEasyCache
+    class cache_t{
+      public long offset=0;
+      public int length=0;
+      public byte[] buff=new byte[0];
+-     public int mtime;
++     public System.DateTime mtime;
+    }
+    Gen::Dictionary&lt;string,cache_t&gt; dic_cache
+      =new Gen::Dictionary&lt;string,cache_t&gt;();
+
+-   public SftpEasyCache(SftpFsOperation operation):base(operation){}
++   public SftpEasyCache(IRemoteFsOperation operation):base(operation){}
+@@ mwg.Sshfs.SftpNoCache.WriteData @ 00:39 2010/06/21
+        // 更新日時
+-       string filename=name.StartsWith(operation.RootDirectory)?name.Substring(operation.RootDirectory.Length):name;
+-       ((Dokan.DokanOperations)operation).SetFileTime(
+-         filename,
+-         System.DateTime.MinValue,
+-         System.DateTime.MinValue,
+-         System.DateTime.Now,
+-         null
+-         );
++       operation.SetMTime(name,System.DateTime.Now);
+-       
+@@ mwg.Sshfs.SftpNoCache @ 00:47 2010/06/21
+# WriteData の中身を SftpFsOperation に移動
+# ReadData の中身を SftpFsOperation に移動
+@@ mwg.Sshfs.SftpNoCache @ 00:47 2010/06/21
+    protected IRemoteFsOperation operation;
+-   protected ISshSession sess;
+    protected SshfsMessage message;
+
+    public SftpNoCache(IRemoteFsOperation operation){
+      this.operation=operation;
+-     this.sess=operation.Session;
+      this.message=operation.Message;
+    }
+</pre>
+<h3>[バグ] 新規作成で作ったテキストファイルへの初回の書込に失敗する。</h3>
+<p>表面上何もエラーが出ていないはずなのに、
+実際に書き込んだファイルを覗いてみると 00 の並びしか書き込まれていない。
+(ファイルサイズは正しくなっている。)
+</p>
+<p>症状は以下のような感じ。</p>
+<ul>
+<li>しかも、デバグの為にステップ実行で実行してみると、ちゃんと中身が書き込まれていた。</li>
+<li>ファイルサイズに関係なくこの現象は起こるようである。</li>
+<li>エクスプローラから新規作成する場合以外でも、
+新しく ssh で追加したファイルに対しても同様の現象が起こる。</li>
+<li>というか、別に、新規作成でなくても、
+マウントしてから初回の書込だとなるようである。</li>
+</ul>
+<h4>原因</h4>
+<p>直後にファイルの更新時間を設定しているが、その時に、
+昔のファイルサイズで set stat していた為。
+書き込んだら、それに応じて stat() で得られるファイルサイズなども更新しなければならない。
+折角新しい内容を書き込んだはずなのに、一旦ファイルを短くして、
+その後で、また、SetAllocationSize で長くしていた為。
+</p>
+<h4>解決</h4>
+<p>直後にファイルの更新時間を設定する際に、
+新しいファイルサイズについてもちゃんと指定するようにした所、
+ちゃんと動作するようになった。
+</p>
+<!--########################################################
+
+            問題8
+
+#########################################################-->
+<h2>B08. アカウントデータの保存</h2>
+<p>従来の保存法方法だと、アカウントデータ型の変更がある度に、
+新しくアカウントを追加しなければならなくなる。
+以前の形式のアカウントデータからでも失敗せずに新しいアカウントデータを初期化できるようにするべき。
+</p>
+<p>→SerializationInfo を使って、初期化・永続化する様にしたら解決した。
+(但し、起動が遅くなったような気もする。)
+</p>
+<!--########################################################
+
+            問題7
+
+#########################################################-->
+<h2>B07. un001.ecc で root directory の stat が異常に遅い - 2010/06/13</h2>
+<p>ファイルの情報を取得する時、それの一つ上の階層のディレクトリを ls するようにしている。
+(同じディレクトリにある他のファイルについても一括で情報を取得する為。)
+root directory を stat する時も、それの一つ上の階層のディレクトリを触ろうとする。
+(root directory に設定しているのがリモートでの root directory で無い時。)
+</p>
+<p>un001 (home を root directory にしている場合) では、
+一つ上の階層 home01 に触ろうとすると矢鱈と時間が掛かる。
+第一に、沢山のディレクトリがありすぎるし、第二に、多分わざと時間が掛かるようにしている。
+</p>
+<p>この様な状況は、他のサーバでもあり得るので、
+root directory に設定したパスより上の階層には本当に触らないようにした方が良い。
+その為、root directory の stat は自分自身に ls して得る様にした。
+</p>
+<h3>修正</h3>
+<pre class="diff mwg-prog-cs">
+@@ mwg.SshFs.SftpFsOperation @ 15:30 2010/06/13
++   private Gen::List&lt;SftpFileInfo&gt; ls_parent(string path){
++     if(path.Length>this.path_remote.Length+1)
++       path=UnixPath.GetParentName(path);
++     return this.ls(path);
++   }
+@@ mwg.SshFs.SftpFsOperation @ 15:30 2010/06/13
+    private FileType GetFileType(string path){
+      if(path.Length>=2&&path[path.Length-1]=='/')
+        path=path.Substring(0,path.Length-1);
+      try{
+        jsch::SftpATTRS attr;
+        if(!this.stat_cache.TryGetAttr(path,out attr)){
+          this.ls_parent(path);
++         if(!this.stat_cache.TryGetAttr(path,out attr)){
++           session.Message.Write(1,"! not found: {0}",path);
++           return FileType.NotExist;
++         }
+-         int index=0;
+-         if(path.Length>1&&(index=path.LastIndexOf('/',path.Length-2))>=0){
+-           string dirpath=path.Substring(0,index+1);
+-           this.ls(dirpath);
+-           if(!this.stat_cache.TryGetAttr(path,out attr)){
+-             session.Message.Write(1,"! not found: {0}",path);
+-             return FileType.NotExist;
+-           }
+-         }else{
+-           attr=this.stat(path);
+-         }
+        }
+@@ mwg.SshFs.SftpFsOperation @ 15:32 2010/06/13
+    private jsch::SftpATTRS stat(string path,bool trace){
+      jsch::SftpATTRS ret;
+      if(this.stat_cache.TryGetAttr(path,out ret))return ret;
+
++     this.ls_parent(path);
+-     this.ls(UnixPath.GetDirectoryName(path));
+      if(this.stat_cache.TryGetAttr(path,out ret))return ret;
+</pre>
+<!--########################################################
+
+            問題6
+
+#########################################################-->
+<h2>B06. 終了時、わざわざ接続してから切断する</h2>
+<p>既に切断されている時に unmount しようとすると、一旦接続してそれから切断しようとする。</p>
+<p>[原因] 何でか見てみたら、アンマウント時に session.Sftp.exit() を実行しようとしていた。
+これだと、Sftp の取得時に切断が切れいていた場合再接続を試みる事になる。
+</p>
+<p>[解決] 接続状態にない ChannelSftp に対しては exit を実行しないようにすればよい。
+そもそも接続状態にある場合でも exit を実行する意義は良く分からないが、
+Disconnect の中で "既存の channel" に対して exit を実行して 1000 msec 待つ様に変更した。
+もしかすると、exit 等実行する意味はないかも知れない。
+</p>
+<p><del>やはり Disconnect で毎回一秒待つようにすると、終了に時間が掛かりすぎてしまうので、
+Unmount の側で一秒待つようにして、Disconnect 内では、
+exit 直後に待たずに切断処理に入るように変更する。</del>
+と思ったけれど、良く考えたら、終了する時は必ず Unmount するので意味無い。
+</p>
+<!--########################################################
+
+            問題5
+
+#########################################################-->
+<h2>B05. 異なる物理ディスクにマウントされたディレクトリ間でのファイルの移動が出来ない</h2>
+<p>SFTP の仕様だろうか? </p>
+<p>→綺麗な解決法は未だ分からない。
+楽なのは、コピーして移動元を削除するという方法</p>
+<p>→コピーするコマンドが SFTP にあると思っていたら、どうやら無いようである。
+仕方がないので、SSH で直接 mv コマンドを実行して無理矢理移動する事にした。
+</p>
+<h3>[バグ]</h3>
+<p>因みに、コマンドの実行結果の標準出力を最後まで読み取ろうとしたら、
+無限ループに陥って CPU を浪費してしまう現象が起きた。
+</p>
+<p>これは、結局、SharpSsh ライブラリに含まれているストリームのバグで、
+ストリーム末端に達した時に Read 戻り値は 0 にするべきなのに、
+戻り値を -1 にしている為に起こった物であった。
+(Java では -1 を返す物なのだろう。.NET に移植する際に其処まで気付かなかったのだと思われる。)
+</p>
+<p>解決は、間に戻り値を -1 から 0 に書き換える為だけの Stream を挟んで行った。
+現在の所ちゃんと動いているようである。
+</p>
+<!--########################################################
+
+            問題4
+
+#########################################################-->
+<h2>B04. 名前を変更した時にファイル一覧内容が反映されない</h2>
+<p>[原因] これは ls でディレクトリ内容をキャッシュしている為に起こる。</p>
+<p>[解決方法]</p>
+<ol style="list-style-type:lower-alpha;">
+<li>自分の属するディレクトリについてのキャッシュを削除する必要がある。
+	<p>これは、ファイルを移動した時にも必要である (移動元、移動先両方)</p>
+</li>
+<li>或いは、キャッシュを削除する代わりに、キャッシュしてある内容を書き換える。
+	<p><strong>×</strong> これだと、リモートで名前の付け替えなどに失敗している場合に、
+	リモートでの情報とローカルでの情報に食い違いが生じる。
+	</p>
+</li>
+</ol>
+<p>→a. で解決する事にする。</p>
+<!--########################################################
+
+            問題3
+
+#########################################################-->
+<h2>B03. 接続が切れた時に、再接続が為されない</h2>
+<p>→どうやら session.isConnected() では、
+　接続が継続されているかどうか判断する事が出来ない様である。
+　自分で session インスタンスを作成しているかどうかだけを見て、
+　エラーが起こったら session が切れていると見做す事にする。
+</p>
+<p>→実行に失敗したら、一回限り Reconnect を試行する様にする。</p>
+<ul>
+<li>n 回 Reconnect を試行する様に変更した。</li>
+<li>n 回は自分で指定する事が出来る様にした。</li>
+</ul>
+<p>→また、長い間接続する場合には次の様な処置を行う。</p>
+<ol>
+<li>一分おきに何か適当な要求を出す
+  <p>現在、SSH_MSG_IGNORE を送る様にしてみた。
+  <del>然し、一分間以上何も要求がないという状態に未だなっていないので、
+  実際にうまく働いているのか居ないのかは良く分からない。</del>
+  暫く使ってみた所、ちゃんと SSH_MSG_IGNORE が送信されているようである。
+  </p>
+</li>
+<li>五分経ったら自動的に切断する
+  <p>実装してみた。
+  <del>然し、放置しようとしても勝手に ls / の要求が来るので、
+  五分間以上要求がないという状態が未だ実現されていなく、
+  これも、ちゃんと動いているかどうかは確認出来ていない。</del>
+  </p>
+  <p>各アカウントへの接続をドライブのサブディレクトリに配置するように変更したので、
+  定期的に ls / があっても、各アカウントへのアクセスにはならなくなった。
+  その為、五分以上要求がないという状態が実現され、ちゃんと切断されるという事も確認出来た。
+  長期的にマウントして使ってみた所、今の所問題は起こっていない。
+  </p>
+</li>
+</ol>
+<div class="note">古いメモ
+<pre>
+// Sessionを自動で切断・接続するという事
+// どれか一つのスレッドで接続を実行するという事
+// 　その間他のスレッドは待機するという事
+// 　タイムアウトを設定した方が良いか?
+// 　タイムアウト時間になっても接続が出来ない時は、失敗　-1 を返す様にする。
+</pre>
+</div>
+<!--########################################################
+
+            問題2
+
+#########################################################-->
+<h2>B02. ファイル名付け替えとキャッシュ</h2>
+<p>例えば、</p>
+<ul>
+<li>a.txt</li>
+<li>b.txt</li>
+</ul>
+<p class="resume">が存在して、b.txt のキャッシュを持っている時に、</p>
+<ol>
+<li>mv b.txt c.txt</li>
+<li>mv a.txt b.txt</li>
+</ol>
+<p class="resume">してから、b.txt の中身を覗こうとすると昔の内容が見えてしまうと思われる。</p>
+<p>ファイルを移動する時、削除する時には、
+それに対応するキャッシュの方にも操作をしなければならない。
+つまり、ファイルを移動する前にファイルを close すれば良い。
+</p>
+<p>→実際にファイルを削除する前と、ファイルを移動する前にキャッシュを Close する様にした。
+確認してみた所、大丈夫なようである。
+</p>
+<p>→そういえば、AutoFileCloser が後でもう一回 close しようとする様な…。
+FileAutoCloser 経由で close する様に書き直した。
+具体的には FileAutoCloser に CloseNow メソッドを追加して、
+その CloseNow を呼び出す事によってファイルを閉じる様にした。
+</p>
+<!--########################################################
+
+            問題1
+
+#########################################################-->
+<h2>B01. ファイルの日時を設定する時に九時間進んでしまう - 2010/06/19</h2>
+<p>System.DateTime の引き算は、Utc であるか否かと言った情報を見ていない?
+<del>というか、そもそも内部に Utc かどうかと言った情報は持っていないのかも知れない。</del>
+(→ちゃんと持っている。Kind プロパティで見る事が出来る)
+</p>
+<p>実際に UniversalTime に変換してから引き算を実行した所、ちゃんと動作するようになった。
+</p>
+<h3>原因</h3>
+<p>.NET Fx の System.DateTime は引き算の時に Kind を正しく参照していない。
+System.DateTime で引き算をする際には、
+自分で Kind を一致させるようにしなければならない。
+</p>
+<h3>修正</h3>
+<pre class="diff mwg-prog-cs">
+@@ mwg.Sshfs.SftpFsOperation.InternalSetFileTime @ 07:42 2010/06/19
+-         System.TimeSpan aspan=(System.TimeSpan)(atime-UNIX_TIMEBASE);
++         System.TimeSpan aspan=(System.TimeSpan)(atime.ToUniversalTime()-UNIX_TIMEBASE);
+@@ mwg.Sshfs.SftpFsOperation.InternalSetFileTime @ 07:42 2010/06/19
+-         System.TimeSpan mspan=(System.TimeSpan)(mtime-UNIX_TIMEBASE);
++         System.TimeSpan mspan=(System.TimeSpan)(mtime.ToUniversalTime()-UNIX_TIMEBASE);
+</pre>
+<!--########################################################
+
+            古い修正履歴
+
+#########################################################-->
+<h2>OA04. TimeoutExecutor の利用</h2>
+<p>折角 TimeoutExecutor に機能を整理したのに使っていなかったので、
+これを使うように変更した。
+</p>
+<pre class="diff mwg-prog-cs">
+@@ mwg.Sshfs.SshSessionBase.
+-            /*
+-            ret.connect();
+-            /*/
+-            if(!Program.ExecTimeout.Execute(ret.connect,3000))return null;
+-            //*/
+-
+-            /*
+-            System.Threading.Thread th=new System.Threading.Thread(ret.connect);
+-            th.Name="SftpChannel#connect";
+-            th.Start();
+-            if(!th.Join(5000)){
+-              th.Abort();
+-              return null;
+-            }
+-            //*/
++            try{
++              Program.ExecTimeout.Execute(ret.connect,3000);
++            }catch{
++              return null;
++            }
+@@ mwg.Sshfs.Program
+     static Program(){
+       bg_thread=new System.Threading.Thread(bg_work);
+       bg_thread.IsBackground=true;
+       bg_thread.Name="&lt;mwg::Sshfs::Program::Background&gt;";
+       bg_thread.Priority=System.Threading.ThreadPriority.BelowNormal;
+       bg_thread.Start();
+ 
+-      //timeout_thread=new System.Threading.Thread(timeout_work);
+-      //timeout_thread.IsBackground=true;
+-      //timeout_thread.Name="&lt;mwg::Sshfs::Program::ExecTimeout&gt;";
+-      //timeout_thread.Start();
+     }
+ 
++    //==========================================================================
++    public static readonly TimeoutExecutor ExecTimeout=new TimeoutExecutor();
+ 
+     //**************************************************************************
+-    static System.Threading.Thread timeout_thread;
+-    static object timeout_sync=new object();
+-    static System.Threading.ThreadStart timeout_proc;
+-    static void timeout_work(){
+-    begin:
+-      try{
+-        while(true){
+-          if(timeout_proc!=null){
+-            timeout_proc();
+-            timeout_proc=null;
+-          }
+-          System.Threading.Thread.Sleep(50);
+-        }
+-      }catch(System.Threading.ThreadAbortException){
+-        goto begin;
+-      }
+-    }
+-    internal static bool ExecTimeout(System.Threading.ThreadStart proc,int milliseconds){
+-      lock(timeout_sync){
+-        timeout_proc=proc;
+-
+-        // 待機
+-        long tick_end=System.DateTime.Now.Ticks+milliseconds*System.TimeSpan.TicksPerMillisecond;
+-        while(timeout_proc!=null&amp;&amp;System.DateTime.Now.Ticks&lt;tick_end)
+-          System.Threading.Thread.Sleep(10);
+-
+-        // 終了
+-        if(timeout_proc!=null){
+-          timeout_thread.Abort();
+-          timeout_proc=null;
+-          return false;
+-        }
+-        return true;
+-      }
+-    }
+</pre>
+
+<h2>OA03. 保存形式の一般化</h2>
+<ul>
+<li>保存形式の一次退避 (XML で保存する為に)
+<pre class="diff mwg-prog-cs">
+-  class ProgramSetting:Ser::ISerializable{
++  public class ProgramSetting:Ser::ISerializable{
+</pre>
+  <p>どうやら、XML で保存する形式にすると、public なメンバしか保存されないようである。
+  結局 BinaryFormatter に頼る事にする。
+  </p>
+</li>
+<li>保存データを管理しているクラスを変更する度に
+  データの受け継ぎの為の変換を考えるのは大変なので、
+  保存データ専用のクラスを作成する事にする。
+  <p>保存データ専用のクラスは、バージョン毎に沢山作って変更を加えないようにする。
+  新しい保存データ形式に対応したい時には、保存データ用のクラスを新しく作成する事にすればよい。
+  保存の時: 本体のクラス → 最新バージョン保存用クラス → 保存
+  読込の時: 読込 → 旧バージョン保存用クラス → 現在のクラス
+  この様にしておけば、何も考えなくても古いバージョンのファイルでも読み込む事が出来る。
+  </p>
+<pre class="diff mwg-prog-cs">
+@@ mwg.Sshfs.ProgramSetting @ 05:05 2010/08/02
+-  [System.Serializable]
+-  class ProgramSetting:Ser::ISerializable{
+   class ProgramSetting{
+@@ mwg.Sshfs.ProgramSetting @ 05:05 2010/08/02
+-    public static bool Save(ProgramSetting setting){
+-      try{
+-        System.Xml.Serialization.XmlSerializer ser
+-          =new System.Xml.Serialization.XmlSerializer(setting.GetType());
+-        using(System.IO.FileStream stream=new System.IO.FileStream(CFGPATH_LIST,System.IO.FileMode.Create))
+-        using(
+-          System.IO.Compression.DeflateStream gzstr=new System.IO.Compression.DeflateStream(
+-          stream,System.IO.Compression.CompressionMode.Compress,true)
+-        ){
+-          ser.Serialize(gzstr,setting);
+-        }
+-        return true;
+-      }catch(System.Exception e){
+-        System.Console.WriteLine("mwg.Sshfs! 設定の保存に失敗しました");
+-        System.Console.WriteLine(e.ToString());
+-        return false;
+-      }
+-    }
++    private static bool Save(ProgramSetting setting){
++      try{
++        System.Runtime.Serialization.Formatters.Binary.BinaryFormatter ser
++          =new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
++        using(System.IO.FileStream stream=new System.IO.FileStream(CFGPATH_LIST+".bin",System.IO.FileMode.Create))
++        using(
++          System.IO.Compression.DeflateStream gzstr=new System.IO.Compression.DeflateStream(
++          stream,System.IO.Compression.CompressionMode.Compress,true)
++        ){
++          ser.Serialize(gzstr,new mwg.Mounter.Serialization.ProgramSettingData000(setting));
++        }
++        return true;
++      }catch(System.Exception e){
++        System.Console.WriteLine("mwg.Sshfs! 設定の保存に失敗しました");
++        System.Console.WriteLine(e.ToString());
++        return false;
++      }
++    }
+     public static ProgramSetting Load(){
+       try{
+         System.Runtime.Serialization.Formatters.Binary.BinaryFormatter bif
+           =new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
+         using(System.IO.FileStream stream=new System.IO.FileStream(CFGPATH_LIST,System.IO.FileMode.OpenOrCreate))
+         using(
+           System.IO.Compression.DeflateStream gzstr=new System.IO.Compression.DeflateStream(
+           stream,System.IO.Compression.CompressionMode.Decompress,true)
+         ){
++          mwg.Mounter.Serialization.ISaveData&lt;ProgramSetting&gt; data;
++          data=(mwg.Mounter.Serialization.ISaveData&lt;ProgramSetting&gt;)bif.Deserialize(gzstr);
++          return data.GenerateInstance();
+-          return (ProgramSetting)bif.Deserialize(gzstr);
+         }
+       }catch(System.Exception e){
+         System.Console.WriteLine("mwg.Sshfs! 設定ファイルを読み込み中に例外が発生しました。");
+         System.Console.WriteLine(e.ToString());
+         return new ProgramSetting();
+       }
+     }
+@@ mwg.Sshfs.ProgramSetting @ 05:05 2010/08/02
+#  色々保存データ形式の変換用に試行錯誤したが、結局不要になったので削除する。
+-#if TRANSFORM
+-    ProgramSetting(Ser::SerializationInfo info,Ser::StreamingContext context){
+-      mwg.Utils.SerializationInfoReader reader=new mwg.Utils.SerializationInfoReader(info);
+-      reader.GetValue("accounts",out this.accounts);
+-    }
+-    void Ser::ISerializable.GetObjectData(Ser::SerializationInfo info,Ser::StreamingContext context){
+-      Gen::List&lt;mwg.Mounter.IFsAccount&gt; saved=new Gen::List&lt;mwg.Mounter.IFsAccount&gt;();
+-      foreach(IAccount acc in accounts)
+-        saved.Add(acc);
+-      info.AddValue("accounts",saved);
+-    }
+-#else
+-    #region ISerializable
+-    ProgramSetting(Ser::SerializationInfo info,Ser::StreamingContext context){
+-      mwg.Utils.SerializationInfoReader reader=new mwg.Utils.SerializationInfoReader(info);
+-      reader.GetValue("accounts",out this.accounts);
+-    }
+-    void Ser::ISerializable.GetObjectData(Ser::SerializationInfo info,Ser::StreamingContext context){
+-      info.AddValue("accounts",this.accounts);
+-    }
+-    #endregion
+-#endif
+-
+</pre>
+</li>
+</ul>
+
+<h2>OA02. DataGridView のセル描画が無意味に複雑になっていたので書き直し。</h2>
+<pre class="diff mwg-prog-cs">
+@@ mwg.Sshfs.UserInterface.SshAccountGwEditor.dataGridView1_CellPainting0
+-    private void dataGridView1_CellPainting0(object sender,Forms::DataGridViewCellPaintingEventArgs e) {
+-      if(e.RowIndex&lt;0)return;
+-      if(e.ColumnIndex!=0&amp;&amp;e.ColumnIndex!=1)return;
+-
+-      // セル状態
+-      GridCellState state=0;
+-      if(0!=(e.State&amp;Forms::DataGridViewElementStates.Selected))
+-        state|=GridCellState.Selected;
+-      SshUserData data=this.gridGwchain.Rows[e.RowIndex].DataBoundItem as SshUserData;
+-      if(data==null)
+-        state|=GridCellState.IsNull;
+-
+-      // 表示内容
+-      string text=drawGridCell_DetermineText(state,e);
+-      Gdi::Color cBack,cFore;
+-      this.drawGridCell_DetermineColor(state,e,out cBack,out cFore);
+-
+-      // 描画
+-      using(Gdi::Pen penGrid=new Gdi::Pen(this.gridGwchain.GridColor))
+-      using(Gdi::Brush brBack=new Gdi::SolidBrush(cBack))
+-      using(Gdi::Brush brFore=new Gdi::SolidBrush(cFore)){
+-        // Clear
+-        e.Graphics.FillRectangle(brBack,e.CellBounds);
+-        e.Graphics.DrawLine(penGrid,
+-          e.CellBounds.Left,e.CellBounds.Bottom-1,
+-          e.CellBounds.Right-1,e.CellBounds.Bottom-1);
+-        e.Graphics.DrawLine(penGrid,
+-          e.CellBounds.Right-1,e.CellBounds.Top,
+-          e.CellBounds.Right-1,e.CellBounds.Bottom);
+-
+-        int h=(e.CellBounds.Height-e.CellStyle.Font.Height)/2;
+-        e.Graphics.DrawString(
+-          text,
+-          e.CellStyle.Font,brFore,
+-          e.CellBounds.X+1,e.CellBounds.Y+h,
+-          Gdi::StringFormat.GenericDefault
+-          );
+-
+-        e.Handled=true;
+-      }
+-    }
+-    [System.Flags]
+-    private enum GridCellState{
+-      Selected=1,
+-      IsInvalid=2,
+-      IsNull=4,
+-    }
+-    private string drawGridCell_DetermineText(GridCellState state,Forms::DataGridViewCellPaintingEventArgs e){
+-      if(e.ColumnIndex==0){
+-        string text;
+-        if(e.Value==null){
+-          text=e.CellStyle.NullValue.ToString();
+-        }else{
+-          text=(string)e.Value;
+-          if(0!=(state&amp;GridCellState.IsInvalid))
+-            text+=" &lt;形式が間違っています&gt;";
+-        }
+-        return text;
+-      }else if(e.ColumnIndex==1){
+-        string text;
+-        if(e.Value==null||(string)e.Value==""){
+-          text=e.CellStyle.NullValue.ToString();
+-        }else{
+-          text=new string('*',((string)e.Value).Length);
+-        }
+-        return text;
+-      }else return null;
+-    }
+-    private void drawGridCell_DetermineColor(
+-      GridCellState state,Forms::DataGridViewCellPaintingEventArgs e,
+-      out Gdi::Color cBack,out Gdi::Color cFore
+-    ){
+-      switch(state){
+-        default:
+-          cBack=e.CellStyle.BackColor;
+-          cFore=e.CellStyle.ForeColor;
+-          break;
+-        case GridCellState.Selected:
+-        case GridCellState.Selected|GridCellState.IsNull:
+-          cBack=e.CellStyle.SelectionBackColor;
+-          cFore=e.CellStyle.SelectionForeColor;
+-          break;
+-        case GridCellState.IsInvalid:
+-          cBack=Gdi::Color.LavenderBlush;
+-          cFore=Gdi::Color.Red;
+-          break;
+-        case GridCellState.Selected|GridCellState.IsInvalid:
+-        case GridCellState.Selected|GridCellState.IsInvalid|GridCellState.IsNull:
+-          cBack=Gdi::Color.Red;
+-          cFore=Gdi::Color.White;
+-          break;
+-        case GridCellState.IsNull:
+-        case GridCellState.IsInvalid|GridCellState.IsNull:
+-          cBack=Gdi::Color.Silver;
+-          cFore=Gdi::Color.Black;
+-          break;
+-      }
+-    }
+</pre>
+<h2>OA01. 引数処理</h2>
+<p>original の引数処理のコードは何故か残っていたが、
+誰も使用していないので、削除する事にした。
+それに伴って独自の引数処理を行うクラス ArgumentReader を実装した。
+現在対応している引き数は -d のみ。
+</p>
+<pre class="diff mwg-prog-cs">
+@@ mwg.Sshfs.Program @ 03:06 2010/08/01
+-    public static bool DokanDebug = false;
+-    public static ushort DokanThread = 0;
+-    public static bool SSHDebug = false;
+-    public static bool UseOffline = true;
++    internal ArgumentReader arguments;
+ 
+     [System.STAThread]
+     private static void Main(){
+ #if add_accounts
+       add_accounts();
+       return;
+ #endif
+       
+       //mwg.Sshfs.Program.ssh_test();
+       //return;
+ 
+-      SSHDebug=true;
+-      DokanDebug=true;
+-
+-      foreach(string str in Environment.GetCommandLineArgs()){
+-        switch(str){
+-          case "-sd":SSHDebug = true;break;
+-          case "-dd":DokanDebug = true;break;
+-          case "-no":UseOffline = false;break;
+-          default:
+-            if(str.StartsWith("-t"))
+-              DokanThread=ushort.Parse(str.Substring(2));
+-            break;
+-        }
+-      }
++      if(!arguments.Read(Environment.GetCommandLineArgs())){
++        System.Console.WriteLine("mwg.Sshfs! 引数指定に誤りが含まれていました。終了します。");
++      }
++
+       Application.EnableVisualStyles();
+       Application.SetCompatibleTextRenderingDefault(false);
+ 
+       //SettingForm form=new SettingForm();
+       //form.sftpAccountEditor1.Account=setting.GetAccount("kocoa") as SftpAccount;
+ 
+       SshfsSetting form=new SshfsSetting();
+       Application.Run(form);
+     }
+</pre>
+
+<h2>古い修正履歴</h2>
+<pre class="diff mwg-prog-cs">
+@@ mwg.Sshfs.SftpFsOperation @ 19:43 2010/06/13
+-   private class PutMonitor:jsch::SftpProgressMonitor{
+-     private long offset_=0L;
+-     public override bool count(long count){
+-       this.offset_+=count;
+-       return true;
+-     }
+-     public override void end(){}
+-     public override void init(int op, string src, string dest, long max){}
+-   }
+@@ mwg.Sshfs.SshGateSession.Connect @ 13:08 2010/05/30
+-     try{
+-       if(user1.idtt!=null)m_jsch.addIdentity(user1.idtt,user1.psph);
+-       sess1=create_session(user1,null);
+-       sess2=create_session(user2,sess1);
+-       return true;
+-     }catch(System.Exception e){
+-       resources.Clear();
+-       msg.ReportErr(e);
+-       return false;
+-     }
+@@ mwg.Sshfs.SshGateSession @ 13:11 2010/05/30
+-   jsch::Session sess1=null;
+-   SshUserData user1;
+-   SshUserData user2;
+@@ mwg.Sshfs.SshGateSession.SshGateSession @ 13:11 2010/05/30
+-     this.user1=user1;
+-     this.user2=user2;
+@@ mwg.Sshfs @ 13:14 2010/05/30
+- [System.Serializable]
+- class SftpAccountGw1:ISftpAccount{
+-   SshUserData gw1=new SshUserData();
+-   SshUserData gw2=new SshUserData();
+-
+-   public ISshSession CreateSession(){
+-     return new SshGateSession(gw1,gw2);
+-   }
+- }
+@@ mwg.Sshfs.SftpStatCache.SetLsResult @ 20:57 2010/05/30
+-     foreach(jsch::ChannelSftp.LsEntry ent in entries){
+-       string file=ent.getFilename();
+-       if(file=="."){
+-         this.InternalSetAttr(path,ent.getAttrs());
+-       }else if(file!=".."){
+-         string path1=dir+file;
+-         jsch::SftpATTRS attr=ent.getAttrs();
+-         operation.ResolveLink(path1,ref attr,30);
+-         this.InternalSetAttr(path1,ent.getAttrs());
+-       }
+-     }
+@@ mwg.Sshfs.SftpStatCache @ 23:03 2010/05/30
+-   struct attr_t{
+-     public SftpLazyAttribute attr; // 情報
+-     public System.DateTime date; // 取得日時
+-     public attr_t(SftpLazyAttribute attr,System.DateTime date){
+-       this.attr=attr;
+-       this.date=date;
+-     }
+-   }
+@@ mwg.Sshfs @ 23:12 2010/05/30
+- class SftpLsEntry{
+-   public string filepath{
+-     get{return this.m_attr.Filepath;}
+-   }
+-   public string filename;
+-   public jsch::SftpATTRS attribute{
+-     get{return this.m_attr.Value;}
+-   }
+-
+-   private SftpLazyAttribute m_attr;
+-   private string longname;
+-
+-   public SftpLsEntry(string filepath,jsch::ChannelSftp.LsEntry entry,SftpLazyAttribute attribute){
+-     this.filename=entry.getFilename();
+-     this.longname=entry.getLongname();
+-     this.m_attr=attribute;
+-   }
+- }
+-
+- /// &lt;summary&gt;
+- /// ファイル属性を保持・取得するクラスです。
+- /// シンボリックリンクの遅延解決を行います。
+- /// &lt;/summary&gt;
+- class SftpLazyAttribute{
+-   private string filepath;
+-   private jsch::SftpATTRS value;
+-   private SftpFsOperation operation;
+-
+-   public string Filepath{
+-     get{return this.filepath;}
+-   }
+-   public jsch::SftpATTRS Value{
+-     get{
+-       lock(value)if(value.isLink()){
+-         operation.ResolveLink(filepath,ref value,30);
+-       }
+-       return value;
+-     }
+-   }
+-
+-   internal SftpLazyAttribute(SftpFsOperation operation,string filepath,jsch::SftpATTRS attr){
+-     this.operation=operation;
+-     this.filepath=filepath;
+-     this.value=attr;
+-   }
+- }
+@@ mwg.Sshfs.SsfFsOperation
+-   string pathCombine(string dir,string path){
+-     if(path.Length==0)return dir;
+-     if(path[0]=='/')return path;
+-     if(!dir.EndsWith("/"))dir+="/";
+-     return dir+path;
+-   }
+-   string pathGetDirectoryName(string path){
+-     int index=path.LastIndexOf('/');
+-     if(index&lt;0)return ".";
+-     if(index==0)return "/";
+-     return path.Substring(0,index);
+-   }
+@@ mwg.Sshfs
+- public class RemoteFsOption{
+-   string RootDirectory;
+-   bool Offline;
+-   bool ReadOnly;
+-   int ReconnectCount;
+-
+-   int DisconnectInterval;
+-   int HeartbeatInterval;
+-
+-   public RemoteFsOption(){
+-     this.Offline=false;
+-     this.ReadOnly=false;
+-     this.ReconnectCount=1;
+-     this.DisconnectInterval=300;
+-     this.HeartbeatInterval=60;
+-   }
+- }
+</pre>
+</body>
+</html>
